@@ -59,11 +59,8 @@ pub fn apply(ctx: &Ctx, only: Option<&str>, dry: bool, skip_missing: bool) -> Re
                 pkg::apply(&selected, dry)?
             }
             "dotfiles" => dotfiles::link(&cfg, &mut state, &[], dry)?,
-            "macos" => macos::apply(&cfg, None, dry)?,
-            other => {
-                ui::warn(format!("unknown stage '{other}', skipping"));
-                Summary::new()
-            }
+            "macos" => macos::apply(&cfg, &mut state, None, dry)?,
+            other => bail!("unknown stage '{other}' (valid: packages, dotfiles, macos)"),
         };
         let failed = stage_summary.any_failed();
         summary.merge(stage_summary);
@@ -247,8 +244,22 @@ pub fn pkg_list(ctx: &Ctx) -> Result<()> {
 
 pub fn macos_apply(ctx: &Ctx, only: Option<&str>, dry: bool) -> Result<()> {
     let cfg = ctx.load()?;
+    let mut state = ctx.state()?;
     let filter = split_only(only);
-    let summary = macos::apply(&cfg, filter.as_deref(), dry)?;
+    let summary = macos::apply(&cfg, &mut state, filter.as_deref(), dry)?;
+    summary.render();
+    Ok(())
+}
+
+pub fn macos_revert(ctx: &Ctx, domain: Option<&str>, dry: bool) -> Result<()> {
+    let cfg = ctx.load()?;
+    let mut state = ctx.state()?;
+    let scope = domain.unwrap_or("all recorded domains");
+    if !dry && !ui::ask(&format!("Revert macOS defaults ({scope})?"), ctx.assume_yes) {
+        ui::warn("Aborted.");
+        return Ok(());
+    }
+    let summary = macos::revert(&cfg, &mut state, domain, dry)?;
     summary.render();
     Ok(())
 }
@@ -258,6 +269,39 @@ pub fn macos_diff(ctx: &Ctx, only: Option<&str>) -> Result<()> {
     let filter = split_only(only);
     let summary = macos::diff(&cfg, filter.as_deref())?;
     summary.render();
+    Ok(())
+}
+
+pub fn macos_record(ctx: &Ctx, domains: &[String], output: Option<&str>, all: bool) -> Result<()> {
+    let cfg = ctx.load()?;
+    let changes = macos::record::record(domains, all)?;
+    if changes.is_empty() {
+        ui::warn("No settings changed between the two snapshots.");
+        ui::detail("If you did change something, re-run with --all to include filtered keys.");
+        return Ok(());
+    }
+    ui::ok(format!("Recorded {} changed key(s)", changes.len()));
+
+    let toml = macos::record::to_toml(&changes);
+    let Some(name) = output else {
+        // Data on stdout, commentary on stderr, so `> file` stays clean.
+        print!("{toml}");
+        return Ok(());
+    };
+
+    let target = cfg.root.join("macos").join(format!("{name}.toml"));
+    if target.exists() {
+        bail!(
+            "{} already exists; pick another --output name or merge by hand",
+            crate::util::tildify(&target)
+        );
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&target, toml).with_context(|| format!("writing {}", target.display()))?;
+    ui::ok(format!("Wrote {}", crate::util::tildify(&target)));
+    ui::detail(format!("Review it, then: macboot macos diff --only {name}"));
     Ok(())
 }
 

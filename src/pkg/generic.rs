@@ -15,6 +15,10 @@ pub enum ListParse {
     /// cargo's `install --list`: lines like `ripgrep v14.0.0:`; take word 1 of
     /// non-indented lines.
     CargoList,
+    /// npm's `--parseable` output: absolute paths like
+    /// `/opt/homebrew/lib/node_modules/pnpm`. The package name is everything
+    /// after the final `node_modules/`, so scoped names survive intact.
+    NpmParseable,
     /// Detection unsupported — provider is apply-only.
     None,
 }
@@ -113,6 +117,14 @@ fn parse_list(out: &str, parse: ListParse) -> Vec<String> {
             .filter_map(|l| l.split_whitespace().next())
             .map(|s| s.trim_end_matches(':').to_string())
             .collect(),
+        ListParse::NpmParseable => out
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.rsplit_once("node_modules/"))
+            // npm itself is bundled with node, never a declared global.
+            .filter(|(_, name)| !name.is_empty() && *name != "npm")
+            .map(|(_, name)| name.to_string())
+            .collect(),
     }
 }
 
@@ -164,7 +176,7 @@ pub fn builtin(name: &str, items: &[String], required: bool) -> Box<dyn Provider
             },
             desired,
             list_args: args(&["ls", "-g", "--depth=0", "--parseable"]),
-            parse: ListParse::FirstColumn,
+            parse: ListParse::NpmParseable,
             install_tpl: args(&["install", "-g", "{pkg}"]),
             remove_tpl: Some(args(&["uninstall", "-g", "{pkg}"])),
         },
@@ -284,6 +296,15 @@ mod tests {
         let out = "ripgrep v14.1.0:\n    rg\ntokei v12.1.2:\n    tokei\n";
         let got = parse_list(out, ListParse::CargoList);
         assert_eq!(got, vec!["ripgrep".to_string(), "tokei".to_string()]);
+    }
+
+    #[test]
+    fn npm_parseable_yields_names_not_paths() {
+        let out = "/opt/homebrew/lib\n/opt/homebrew/lib/node_modules/npm\n\
+                   /opt/homebrew/lib/node_modules/pnpm\n\
+                   /opt/homebrew/lib/node_modules/@angular/cli\n";
+        let got = parse_list(out, ListParse::NpmParseable);
+        assert_eq!(got, vec!["pnpm".to_string(), "@angular/cli".to_string()]);
     }
 
     #[test]

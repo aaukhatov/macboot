@@ -65,6 +65,8 @@ macboot pkg list                                        # providers + availabili
 macboot brew …                                          # alias for pkg --provider brew
 
 macboot macos apply|diff [--only dock,finder,…]         # declarative defaults
+macboot macos record [--domain …] [--output NAME]       # System Settings → TOML
+macboot macos revert [--domain …] [--dry-run]           # undo defaults macboot wrote
 macboot keyboard dump [--stdout] [--dry-run]            # reverse symbolichotkeys → TOML
 macboot keyboard apply                                  # import keybindings + reload
 
@@ -73,6 +75,37 @@ macboot doctor            (alias: verify)               # full self-check, non-z
 macboot capture                                         # snapshot machine → manifest form
 macboot completions <shell>
 ```
+
+## macOS settings
+
+You don't need to know a `domain`/`key` pair to manage a setting. `macos record` snapshots
+every preference domain, waits while you click around in System Settings, then prints the
+difference as `[[defaults]]` blocks:
+
+```sh
+macboot macos record                          # all domains (~7s), then tweak and press Enter
+macboot macos record --domain com.apple.dock  # narrower and instant
+macboot macos record --output dock            # write macos/dock.toml instead of stdout
+```
+
+Keys that churn on their own (window frames, recent-item lists, session IDs) are filtered;
+pass `--all` to keep them. Values macboot can't yet express as `[[defaults]]` — arrays and
+dicts — are emitted as comments rather than silently dropped.
+
+Every key macboot writes has its previous value recorded in the state file first, so changes
+are undoable the same way dotfile links are:
+
+```sh
+macboot macos revert --dry-run                # show what would be restored
+macboot macos revert --domain com.apple.dock  # restore; keys that didn't exist are deleted
+```
+
+Revert always returns a key to the value it held *before macboot first touched it*, no matter
+how many `apply` runs happened in between.
+
+> Output convention: stdout carries only data (the TOML from `record`, `dump`, and `capture`);
+> all progress and summary output goes to stderr, so `macboot macos record > macos/dock.toml`
+> produces a clean file.
 
 ## Keybindings
 

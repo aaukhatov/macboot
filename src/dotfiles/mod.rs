@@ -25,12 +25,16 @@ pub enum Action {
     Repoint,
     /// A foreign file/dir/symlink occupies the target — back it up, then link.
     Backup,
+    /// A symlinked directory sits between `$HOME` and this target, so every
+    /// filesystem call here writes *through* that link. Reported, never applied.
+    Blocked,
 }
 
 impl Action {
     fn status(self) -> Status {
         match self {
             Action::AlreadyLinked => Status::Unchanged,
+            Action::Blocked => Status::Skipped,
             _ => Status::Changed,
         }
     }
@@ -62,7 +66,7 @@ pub fn plan(cfg: &Config, state: &State, packages: &[String]) -> Result<Vec<Plan
                 .strip_prefix(&pkg_dir)
                 .expect("walked path is under pkg_dir");
             let target = home.join(rel);
-            let action = classify(&target, &source, state);
+            let action = classify(&target, &source, state, &home);
             items.push(PlanItem {
                 package: pkg.clone(),
                 target,
@@ -75,8 +79,40 @@ pub fn plan(cfg: &Config, state: &State, packages: &[String]) -> Result<Vec<Plan
     Ok(items)
 }
 
+/// The first symlinked directory between `home` and `target`, if any.
+///
+/// `symlink_metadata` only tells us about the final component: it happily
+/// follows a symlinked *parent*. Without this check, a target under a linked
+/// directory looks like an ordinary foreign file, and `link` would "back up"
+/// the very file inside the config repo that the link points at.
+fn symlinked_ancestor(target: &Path, home: &Path) -> Option<PathBuf> {
+    let rel = target.strip_prefix(home).ok()?;
+    let mut acc = home.to_path_buf();
+    let mut components: Vec<_> = rel.components().collect();
+    components.pop(); // the leaf itself is classified normally
+    for component in components {
+        acc.push(component);
+        let is_link = std::fs::symlink_metadata(&acc)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_link {
+            return Some(acc);
+        }
+    }
+    None
+}
+
 /// Decide the action for one target given the current filesystem + state.
-fn classify(target: &Path, source: &Path, state: &State) -> Action {
+fn classify(target: &Path, source: &Path, state: &State, home: &Path) -> Action {
+    if symlinked_ancestor(target, home).is_some() {
+        // If the path already resolves to our source through that link, the
+        // file is effectively linked; otherwise refuse to touch it.
+        let resolved = (std::fs::canonicalize(target), std::fs::canonicalize(source));
+        return match resolved {
+            (Ok(t), Ok(s)) if t == s => Action::AlreadyLinked,
+            _ => Action::Blocked,
+        };
+    }
     match std::fs::symlink_metadata(target) {
         Err(_) => Action::Create, // nothing there
         Ok(meta) => {
@@ -110,6 +146,14 @@ pub fn link(cfg: &Config, state: &mut State, packages: &[String], dry: bool) -> 
         );
         if item.action == Action::AlreadyLinked {
             summary.record(Status::Unchanged, &label);
+            continue;
+        }
+        if item.action == Action::Blocked {
+            summary.record(Status::Skipped, &label);
+            ui::detail(format!(
+                "a parent directory of {} is a symlink; adopt or unlink it first",
+                util::tildify(&item.target)
+            ));
             continue;
         }
         if dry {
@@ -149,6 +193,7 @@ fn apply_one(item: &PlanItem, state: &mut State) -> Result<()> {
             backup = Some(back_up(&item.target, state)?);
         }
         Action::AlreadyLinked => return Ok(()),
+        Action::Blocked => bail!("refusing to write through a symlinked parent directory"),
     }
 
     std::os::unix::fs::symlink(&item.source, &item.target).with_context(|| {
@@ -281,8 +326,13 @@ pub fn status(cfg: &Config, state: &State, packages: &[String]) -> Result<Summar
     Ok(summary)
 }
 
-/// `adopt`: move an existing `~/…` file into package `pkg` (preserving its path
+/// `adopt`: move an existing `~/…` path into package `pkg` (preserving its path
 /// relative to `$HOME`), then link it back.
+///
+/// A directory is adopted as its individual file leaves, never as a single
+/// directory symlink: the link engine links files, and a directory symlink
+/// would leave every file under it unreachable to `plan` except *through* that
+/// link (see [`symlinked_ancestor`]).
 pub fn adopt(
     cfg: &Config,
     state: &mut State,
@@ -296,35 +346,89 @@ pub fn adopt(
     } else {
         home.join(file)
     };
-    let rel = abs
-        .strip_prefix(&home)
-        .with_context(|| format!("{} is not under $HOME", abs.display()))?;
     let meta = std::fs::symlink_metadata(&abs)
         .with_context(|| format!("{} does not exist", abs.display()))?;
     if meta.file_type().is_symlink() {
         bail!("{} is already a symlink; nothing to adopt", abs.display());
     }
+    if let Some(link) = symlinked_ancestor(&abs, &home) {
+        bail!(
+            "{} lives under the symlink {}; unlink it before adopting",
+            util::tildify(&abs),
+            util::tildify(&link)
+        );
+    }
+
+    let mut summary = Summary::new();
+    let files: Vec<PathBuf> = if meta.is_dir() {
+        let mut found = Vec::new();
+        for entry in WalkDir::new(&abs).follow_links(false) {
+            let entry = entry.with_context(|| format!("walking {}", abs.display()))?;
+            if entry.file_type().is_file() {
+                found.push(entry.path().to_path_buf());
+            }
+        }
+        found.sort();
+        if found.is_empty() {
+            ui::warn(format!("{} contains no files", util::tildify(&abs)));
+            return Ok(summary);
+        }
+        ui::detail(format!(
+            "{} is a directory; adopting its {} file(s)",
+            util::tildify(&abs),
+            found.len()
+        ));
+        found
+    } else {
+        vec![abs]
+    };
+
+    for path in &files {
+        summary.merge(adopt_file(cfg, state, pkg, path, &home, dry)?);
+    }
+    if !dry {
+        state.save()?;
+    }
+    Ok(summary)
+}
+
+/// Adopt exactly one file. Does not persist state — the caller saves once.
+fn adopt_file(
+    cfg: &Config,
+    state: &mut State,
+    pkg: &str,
+    abs: &Path,
+    home: &Path,
+    dry: bool,
+) -> Result<Summary> {
+    let rel = abs
+        .strip_prefix(home)
+        .with_context(|| format!("{} is not under $HOME", abs.display()))?;
     let dest = cfg.dotfiles_dir().join(pkg).join(rel);
     let mut summary = Summary::new();
-    let label = format!("{} -> {}/{}", util::tildify(&abs), pkg, rel.display());
+    let label = format!("{} -> {}/{}", util::tildify(abs), pkg, rel.display());
     if dry {
         summary.record(Status::Changed, &format!("{label} [dry-run]"));
+        return Ok(summary);
+    }
+    if dest.exists() {
+        ui::err(format!("{} already exists in the repo", dest.display()));
+        summary.record(Status::Failed, &label);
         return Ok(summary);
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::rename(&abs, &dest).with_context(|| format!("moving {} into repo", abs.display()))?;
-    std::os::unix::fs::symlink(&dest, &abs)
+    std::fs::rename(abs, &dest).with_context(|| format!("moving {} into repo", abs.display()))?;
+    std::os::unix::fs::symlink(&dest, abs)
         .with_context(|| format!("linking {} back", abs.display()))?;
     state.insert(LinkRecord {
         package: pkg.to_string(),
-        target: abs,
+        target: abs.to_path_buf(),
         source: dest,
         backup: None,
         created: util::now_stamp(),
     });
-    state.save()?;
     summary.record(Status::Changed, &label);
     Ok(summary)
 }
@@ -352,6 +456,7 @@ fn action_label(action: Action) -> &'static str {
         Action::AlreadyLinked => "ok",
         Action::Repoint => "repoint",
         Action::Backup => "backup+link",
+        Action::Blocked => "blocked: symlinked parent",
     }
 }
 
@@ -412,5 +517,53 @@ mod tests {
         let state = State::default();
         let items = plan(&cfg, &state, &[]).unwrap();
         assert_eq!(items[0].action, Action::Backup);
+    }
+
+    #[test]
+    fn file_under_symlinked_parent_is_blocked_not_backed_up() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+        let cfg = scaffold(dir.path(), "nvim", ".config/nvim/init.lua", "managed");
+
+        // ~/.config/nvim is a symlink to somewhere else entirely: every path
+        // under it writes through the link, so we must not touch it.
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(home.join(".config")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join(".config/nvim")).unwrap();
+
+        let items = plan(&cfg, &State::default(), &[]).unwrap();
+        assert_eq!(items[0].action, Action::Blocked);
+    }
+
+    #[test]
+    fn adopting_a_directory_links_each_file_and_survives_relink() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let nvim = home.join(".config/nvim");
+        fs::create_dir_all(&nvim).unwrap();
+        fs::write(nvim.join("init.lua"), "REAL CONTENT").unwrap();
+        std::env::set_var("HOME", &home);
+
+        fs::create_dir_all(dir.path().join("dotfiles/nvim")).unwrap();
+        let cfg = Config::load(dir.path(), Some("personal")).unwrap();
+        let mut state = State::load(&dir.path().join("state.json")).unwrap();
+
+        adopt(&cfg, &mut state, "nvim", Path::new(".config/nvim"), false).unwrap();
+        // The directory itself must NOT have become a symlink.
+        assert!(fs::symlink_metadata(&nvim).unwrap().is_dir());
+
+        // A follow-up link is a no-op, and the content is still reachable.
+        let items = plan(&cfg, &state, &[]).unwrap();
+        assert_eq!(items[0].action, Action::AlreadyLinked);
+        link(&cfg, &mut state, &[], false).unwrap();
+        assert_eq!(
+            fs::read_to_string(nvim.join("init.lua")).unwrap(),
+            "REAL CONTENT"
+        );
     }
 }

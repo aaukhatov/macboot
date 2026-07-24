@@ -41,6 +41,23 @@ pub trait Provider {
     /// Remove the given packages.
     fn remove(&self, extraneous: &[String], dry: bool) -> Result<()>;
 
+    /// Render what is installed as this provider's `packages.toml` block.
+    ///
+    /// The output must parse back into the same provider — `dump` feeds
+    /// straight into a manifest, so a key this provider's spec does not accept
+    /// would silently declare nothing.
+    fn dump_block(&self) -> Result<String> {
+        let mut installed = self.installed()?;
+        installed.sort();
+        let rendered: Vec<String> = installed.iter().map(|i| format!("{i:?}")).collect();
+        Ok(format!(
+            "[{}]\n{} = [{}]\n",
+            self.name(),
+            generic::items_key(self.name()),
+            rendered.join(", ")
+        ))
+    }
+
     fn is_available(&self) -> bool {
         crate::proc::has_command(self.cli())
     }
@@ -207,10 +224,10 @@ pub fn report_diff(providers: &[&dyn Provider]) -> Result<bool> {
         }
         any = true;
         for m in &d.missing {
-            println!("  {} {m}", Status::Changed.glyph());
+            eprintln!("  {} {m}", Status::Changed.glyph());
         }
         for e in &d.extraneous {
-            println!("  {} {e} (extraneous)", Status::Changed.glyph());
+            eprintln!("  {} {e} (extraneous)", Status::Changed.glyph());
         }
     }
     Ok(any)
@@ -254,12 +271,7 @@ pub fn dump(providers: &[&dyn Provider]) -> Result<()> {
         if !p.is_available() || !p.supports_diff() {
             continue;
         }
-        let mut installed = p.installed()?;
-        installed.sort();
-        println!("[{}]", p.name());
-        let key = generic::items_key(p.name());
-        let rendered: Vec<String> = installed.iter().map(|i| format!("{i:?}")).collect();
-        println!("{key} = [{}]", rendered.join(", "));
+        print!("{}", p.dump_block()?);
         println!();
     }
     Ok(())

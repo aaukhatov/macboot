@@ -11,6 +11,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Packages {
     pub brew: Option<BrewSpec>,
     pub cargo: Option<ListSpec>,
@@ -26,6 +27,7 @@ pub struct Packages {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Providers {
     #[serde(default)]
     pub custom: BTreeMap<String, CustomProvider>,
@@ -34,6 +36,7 @@ pub struct Providers {
 /// Homebrew: taps + formulae + casks + Mac App Store + VS Code, applied via
 /// `brew bundle`.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrewSpec {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -55,6 +58,7 @@ pub struct BrewSpec {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MasApp {
     pub name: String,
     pub id: u64,
@@ -63,6 +67,7 @@ pub struct MasApp {
 /// A flat-list provider. `items` accepts whatever key reads naturally per tool
 /// (crates/packages/globals/apps/tools/ports) via serde aliases.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListSpec {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -83,6 +88,7 @@ pub struct ListSpec {
 /// A user-defined provider driven entirely by command templates. `{pkg}` in a
 /// template is substituted per package.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustomProvider {
     #[serde(default = "default_true")]
     pub enabled: bool,

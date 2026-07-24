@@ -63,6 +63,31 @@ impl BrewProvider {
     }
 }
 
+/// Lines of a `brew` listing command, trimmed and free of blanks.
+fn brew_lines(args: &[&str]) -> Vec<String> {
+    match proc::output("brew", args) {
+        Ok(text) => text
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `brew leaves` = installed formulae not depended on by others.
+fn installed_formulae() -> Vec<String> {
+    brew_lines(&["leaves"])
+}
+
+fn installed_casks() -> Vec<String> {
+    brew_lines(&["list", "--cask", "-1"])
+}
+
+fn installed_taps() -> Vec<String> {
+    brew_lines(&["tap"])
+}
+
 impl Provider for BrewProvider {
     fn name(&self) -> &str {
         "brew"
@@ -88,15 +113,26 @@ impl Provider for BrewProvider {
     }
 
     fn installed(&self) -> Result<Vec<String>> {
-        let mut out = Vec::new();
-        // `brew leaves` = installed formulae not depended on by others.
-        if let Ok(text) = proc::output("brew", &["leaves"]) {
-            out.extend(text.lines().map(|l| l.trim().to_string()));
+        let mut out = installed_formulae();
+        out.extend(installed_casks());
+        Ok(out)
+    }
+
+    /// Homebrew spans four manifest keys, so the generic one-list default would
+    /// emit a `packages = [...]` key that [`BrewSpec`] does not accept.
+    fn dump_block(&self) -> Result<String> {
+        let mut out = String::from("[brew]\n");
+        for (key, mut values) in [
+            ("taps", installed_taps()),
+            ("brews", installed_formulae()),
+            ("casks", installed_casks()),
+        ] {
+            values.sort();
+            let rendered: Vec<String> = values.iter().map(|v| format!("{v:?}")).collect();
+            out.push_str(&format!("{key} = [{}]\n", rendered.join(", ")));
         }
-        if let Ok(text) = proc::output("brew", &["list", "--cask", "-1"]) {
-            out.extend(text.lines().map(|l| l.trim().to_string()));
-        }
-        out.retain(|s| !s.is_empty());
+        // mas and vscode are apply-only (not part of the diff scope), so they
+        // are left for the user rather than guessed at.
         Ok(out)
     }
 

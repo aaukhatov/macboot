@@ -64,8 +64,14 @@ restores the backup. Backups live in `<state dir>/backups/<timestamp>/`.
 
 `dotfiles::plan` walks each package tree (mirroring `$HOME`) and classifies each file leaf into an
 `Action`: `Create` / `AlreadyLinked` / `Repoint` (our link, wrong target) / `Backup` (foreign file —
-move aside first). `link` executes the plan; `status` reports it read-only. Both go through the same
-`plan`, so drift reporting and application can never disagree.
+move aside first) / `Blocked`. `link` executes the plan; `status` reports it read-only. Both go
+through the same `plan`, so drift reporting and application can never disagree.
+
+`Blocked` guards a sharp edge: `symlink_metadata` follows symlinked *parent* directories, so a
+target under a linked dir looks like an ordinary foreign file and would be "backed up" — moving
+the very repo file the link points at. `symlinked_ancestor` detects this and refuses. For the same
+reason `adopt` never creates a directory symlink: a directory is adopted as its individual file
+leaves.
 
 ### Packages (`pkg/`)
 
@@ -92,7 +98,22 @@ prints remediation from `Provider::remediation`.
 Every `defaults` value is read via `is_in_sync` before it is written, which is what makes `apply`
 idempotent and `diff` meaningful. A `macos/*.toml` file may contain `[[defaults]]`, `[[command]]`
 (escape hatch, optional `sudo`), `[[app_shortcut]]`, `[[hotkey]]`/`[[raw]]`, and `killall`.
-`killall` targets are deduplicated across all files and run once at the end of `apply`.
+`killall` targets are deduplicated across all files and run once at the end of `apply` — but only
+for files that actually changed something, since restarting Dock/Finder is user-visible.
+
+`--only` names are validated against the files that exist (`selected_files` returns `Result`): a
+mistyped filter must never look like a successful no-op.
+
+`macos::apply` takes `&mut State`. Before the *first* write to any key it records that key's
+previous value and `defaults read-type` into `state.defaults`, which is what `macos revert`
+replays — a key that did not exist is deleted, one that did is written back with its original
+type. Later applies never overwrite the recorded original, so revert always reaches the
+pre-macboot state.
+
+`macos/record.rs` is the discovery half: it exports every domain (8 scoped threads, ~3s for 736
+domains), waits on `ui::pause`, exports again, and renders the diff as `[[defaults]]` blocks.
+Churn keys are filtered via `NOISY_KEY_FRAGMENTS`/`NOISY_DOMAINS`; shapes that `[[defaults]]`
+cannot express become comments so the output always parses back into a `MacosFile`.
 
 `macos/keyboard.rs` translates both directions between the opaque `com.apple.symbolichotkeys` plist
 (`parameters = [ascii, keycode, modifierMask]`) and friendly `action`/`chord` TOML. `ACTIONS` and
@@ -109,6 +130,13 @@ data. `apply` writes a temp plist, `defaults import`s it, then runs `activateSet
 - **All user-visible output goes through `ui.rs`** (`info`/`warn`/`err`/`ok`/`detail`/`heading`).
   `Summary::record` both counts an outcome *and* prints its line — don't print the line separately.
   Failures are collected and re-printed by `render()`.
+- **`ui.rs` writes to stderr; stdout is data only.** The TOML from `pkg dump`, `macos record`,
+  `keyboard dump`, and `capture` is the only thing on stdout, so `… > macos/dock.toml` works.
+  Never `println!` commentary.
+- **Anything `dump`-like must round-trip.** Output is fed straight back into a manifest, so it
+  has to parse into the same struct that produced it — hence `Provider::dump_block` (brew
+  overrides it to emit `taps`/`brews`/`casks` rather than a key `BrewSpec` would ignore) and
+  `#[serde(deny_unknown_fields)]` on every spec in `config/packages.rs`.
 - **Errors use `anyhow` with `.context()`** naming the path or command involved; `main` prints
   `{e:#}` and exits 1.
 - Exit codes are load-bearing: `pkg diff` exits 1 on drift and `doctor` exits 1 on failure so they

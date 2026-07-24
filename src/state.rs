@@ -24,11 +24,37 @@ pub struct LinkRecord {
     pub created: String,
 }
 
+/// One `defaults` key macboot has written, and what it held beforehand.
+///
+/// The dotfiles engine backs up any file it displaces; this is the same promise
+/// for macOS settings, and what makes `macos revert` possible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefaultRecord {
+    pub domain: String,
+    pub key: String,
+    /// Raw `defaults read` output from before macboot first wrote this key.
+    /// `None` means the key did not exist and revert should delete it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    /// `defaults read-type` result for that value (e.g. "boolean"), so revert
+    /// can write it back with the right flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_type: Option<String>,
+    /// Whether writing this domain needed sudo.
+    #[serde(default)]
+    pub sudo: bool,
+    /// ISO-ish timestamp of the first time macboot wrote this key.
+    pub recorded: String,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
     /// Keyed by the absolute target path (as a string) for quick lookup.
     #[serde(default)]
     pub links: BTreeMap<String, LinkRecord>,
+    /// Keyed by `"<domain> <key>"`.
+    #[serde(default)]
+    pub defaults: BTreeMap<String, DefaultRecord>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -92,4 +118,24 @@ impl State {
     pub fn for_package<'a>(&'a self, package: &'a str) -> impl Iterator<Item = &'a LinkRecord> {
         self.links.values().filter(move |r| r.package == package)
     }
+
+    /// Have we already recorded the pre-macboot value of this key?
+    pub fn knows_default(&self, domain: &str, key: &str) -> bool {
+        self.defaults.contains_key(&default_key(domain, key))
+    }
+
+    /// Record a key's original value. Only the *first* write is kept, so revert
+    /// always returns to the state the machine was in before macboot touched it.
+    pub fn insert_default(&mut self, record: DefaultRecord) {
+        let slot = default_key(&record.domain, &record.key);
+        self.defaults.entry(slot).or_insert(record);
+    }
+
+    pub fn remove_default(&mut self, domain: &str, key: &str) -> Option<DefaultRecord> {
+        self.defaults.remove(&default_key(domain, key))
+    }
+}
+
+fn default_key(domain: &str, key: &str) -> String {
+    format!("{domain} {key}")
 }
