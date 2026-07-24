@@ -156,10 +156,14 @@ enum PkgCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Print installed packages in packages.toml form (stdout).
+    /// Snapshot installed packages into packages/<provider>/ in each manager's
+    /// own format (Brewfile, package.json, ...).
     Dump {
         #[arg(long)]
         provider: Option<String>,
+        /// Print to stdout instead of writing the files.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List declared providers and availability.
     List,
@@ -315,7 +319,9 @@ fn dispatch_pkg(ctx: &Ctx, cmd: PkgCmd, pin_brew: bool) -> anyhow::Result<()> {
         PkgCmd::Clean { provider, dry_run } => {
             commands::pkg_clean(ctx, pin(provider).as_deref(), dry_run)
         }
-        PkgCmd::Dump { provider } => commands::pkg_dump(ctx, pin(provider).as_deref()),
+        PkgCmd::Dump { provider, dry_run } => {
+            commands::pkg_dump(ctx, pin(provider).as_deref(), dry_run)
+        }
         PkgCmd::List => commands::pkg_list(ctx),
     }
 }

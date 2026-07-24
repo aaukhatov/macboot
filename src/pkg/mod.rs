@@ -10,6 +10,7 @@ pub mod generic;
 use crate::config::Packages;
 use crate::ui::{self, Status, Summary};
 use anyhow::{bail, Result};
+use std::path::Path;
 
 /// How to install a missing provider CLI — shown by the preflight and `doctor`.
 #[derive(Debug, Clone)]
@@ -41,9 +42,27 @@ pub trait Provider {
     /// Remove the given packages.
     fn remove(&self, extraneous: &[String], dry: bool) -> Result<()>;
 
+    /// File name `pkg dump` writes for this provider, in the manager's own
+    /// format. Lands at `packages/<provider>/<file>` under the config root.
+    fn dump_file(&self) -> &str {
+        "packages.txt"
+    }
+
+    /// What is installed, rendered in this manager's native format.
+    ///
+    /// The default is a bare newline-delimited list — the natural artifact for
+    /// managers that have no manifest format of their own, and directly usable
+    /// as `xargs <cli> install < packages.txt`. Keep such files comment-free:
+    /// `xargs` has no notion of comments.
+    fn dump_native(&self) -> Result<String> {
+        let mut installed = self.installed()?;
+        installed.sort();
+        Ok(generic::lines_file(&installed))
+    }
+
     /// Render what is installed as this provider's `packages.toml` block.
     ///
-    /// The output must parse back into the same provider — `dump` feeds
+    /// The output must parse back into the same provider — `capture` feeds
     /// straight into a manifest, so a key this provider's spec does not accept
     /// would silently declare nothing.
     fn dump_block(&self) -> Result<String> {
@@ -264,9 +283,48 @@ pub fn clean(providers: &[&dyn Provider], dry: bool) -> Result<Summary> {
     Ok(summary)
 }
 
-/// `pkg dump`: print a `packages.toml`-shaped snapshot of what is installed, per
-/// provider, to stdout (redirect to update the manifest after review).
-pub fn dump(providers: &[&dyn Provider]) -> Result<()> {
+/// `pkg dump`: snapshot each provider's installed set into
+/// `packages/<provider>/<native file>`, or print it on a dry run.
+///
+/// These files are outputs, not inputs: `packages.toml` stays the manifest
+/// `apply` reads. Each one is a complete re-render of what is installed, so a
+/// dump replaces the previous snapshot.
+pub fn dump(providers: &[&dyn Provider], root: &Path, dry: bool) -> Result<Summary> {
+    let mut summary = Summary::new();
+    for p in providers {
+        if !p.is_available() {
+            summary.record(Status::Skipped, &format!("{} (CLI missing)", p.name()));
+            continue;
+        }
+        if !p.supports_diff() {
+            summary.record(
+                Status::Skipped,
+                &format!("{} (cannot list installed packages)", p.name()),
+            );
+            continue;
+        }
+        let rel = format!("packages/{}/{}", p.name(), p.dump_file());
+        let target = root.join(&rel);
+        let outcome = p
+            .dump_native()
+            .and_then(|body| crate::util::write_generated(&target, &body, dry));
+        match outcome {
+            Ok(()) => summary.record(
+                Status::Changed,
+                &format!("{rel}{}", if dry { " [dry-run]" } else { "" }),
+            ),
+            Err(e) => {
+                ui::err(format!("{}: {e:#}", p.name()));
+                summary.record(Status::Failed, p.name());
+            }
+        }
+    }
+    Ok(summary)
+}
+
+/// `capture`: print a `packages.toml`-shaped snapshot of what is installed, per
+/// provider, to stdout (paste into the manifest after review).
+pub fn dump_toml(providers: &[&dyn Provider]) -> Result<()> {
     for p in providers {
         if !p.is_available() || !p.supports_diff() {
             continue;

@@ -86,8 +86,21 @@ provider-agnostic. Two implementations exist:
   (`supports_diff() == false`).
 
 To add a built-in flat-list provider: add the field to `Packages`, add it to
-`Packages::list_providers`, add a match arm in `generic::builtin`, and add its manifest key to
-`generic::items_key` (used by `dump`). No change to the command layer.
+`Packages::list_providers`, add a match arm in `generic::builtin` (including its `dump_file` /
+`DumpFormat`), and add its manifest key to `generic::items_key` (used by `capture`). No change to
+the command layer.
+
+Two different dumps exist, and they are not interchangeable:
+
+- `pkg::dump` (`pkg dump`) writes `packages/<provider>/<file>` in the *manager's* native format —
+  `Provider::dump_file` + `dump_native` (Brewfile, package.json, mise.toml, else a bare
+  newline-delimited list). Output only: nothing reads these back, `packages.toml` stays the
+  manifest. Keep list files comment-free — they are meant for `xargs`.
+- `pkg::dump_toml` (`capture`) prints `packages.toml` blocks to stdout via `Provider::dump_block`,
+  which is the one that must round-trip into the manifest.
+
+Providers with `supports_diff() == false` can't enumerate what they installed, so `pkg dump` skips
+them rather than writing an empty file.
 
 `registry()` only ever builds providers that are *declared* in the manifest — an undeclared manager
 is never touched. `preflight()` fails on a missing **required** CLI (unless `--skip-missing`) and
@@ -135,13 +148,17 @@ data. `apply` writes a temp plist, `defaults import`s it, then runs `activateSet
 - **All user-visible output goes through `ui.rs`** (`info`/`warn`/`err`/`ok`/`detail`/`heading`).
   `Summary::record` both counts an outcome *and* prints its line — don't print the line separately.
   Failures are collected and re-printed by `render()`.
-- **`ui.rs` writes to stderr; stdout is data only.** The TOML from `pkg dump`, `capture`, and the
-  `--dry-run` form of `macos dump`/`keyboard dump` is the only thing on stdout, so
-  `… --dry-run > macos/dock.toml` works. Never `println!` commentary.
-- **Anything `dump`-like must round-trip.** Output is fed straight back into a manifest, so it
-  has to parse into the same struct that produced it — hence `Provider::dump_block` (brew
-  overrides it to emit `taps`/`brews`/`casks` rather than a key `BrewSpec` would ignore) and
-  `#[serde(deny_unknown_fields)]` on every spec in `config/packages.rs`.
+- **Every `dump` writes a file; `--dry-run` prints it to stdout instead.** They all go through
+  `util::write_generated`, so the behavior can't drift apart. Default destinations:
+  `macos/<--output>.toml` (default `settings`, refuses to clobber), `macos/keyboard.toml`
+  (replaced), `packages/<provider>/<native file>` (replaced).
+- **`ui.rs` writes to stderr; stdout is data only.** The TOML from `capture` and the body of any
+  `dump --dry-run` is the only thing on stdout, so `… --dry-run > macos/dock.toml` works. Never
+  `println!` commentary.
+- **Anything fed back into a manifest must round-trip.** It has to parse into the same struct that
+  produced it — hence `Provider::dump_block` (brew overrides it to emit `taps`/`brews`/`casks`
+  rather than a key `BrewSpec` would ignore) and `#[serde(deny_unknown_fields)]` on every spec in
+  `config/packages.rs`. The native `pkg dump` files round-trip into *their own manager* instead.
 - **Errors use `anyhow` with `.context()`** naming the path or command involved; `main` prints
   `{e:#}` and exits 1.
 - Exit codes are load-bearing: `pkg diff` exits 1 on drift and `doctor` exits 1 on failure so they

@@ -206,11 +206,13 @@ pub fn pkg_clean(ctx: &Ctx, only: Option<&str>, dry: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn pkg_dump(ctx: &Ctx, only: Option<&str>) -> Result<()> {
+pub fn pkg_dump(ctx: &Ctx, only: Option<&str>, dry: bool) -> Result<()> {
     let cfg = ctx.load()?;
     let providers = pkg::registry(&cfg.packages);
     let selected = pkg::select(&providers, only)?;
-    pkg::dump(&selected)
+    let summary = pkg::dump(&selected, &cfg.root, dry)?;
+    summary.render();
+    Ok(())
 }
 
 pub fn pkg_list(ctx: &Ctx) -> Result<()> {
@@ -276,9 +278,8 @@ pub fn macos_diff(ctx: &Ctx, only: Option<&str>) -> Result<()> {
 const DEFAULT_DUMP_NAME: &str = "settings";
 
 /// Write generated TOML to `<config>/macos/<name>.toml`, or print it on a dry
-/// run. Data goes to stdout and commentary to stderr, so `--dry-run > file`
-/// still produces a clean file. `overwrite` is for files the dump owns end to
-/// end (keyboard.toml); anything else refuses to clobber a curated file.
+/// run. `overwrite` is for files the dump owns end to end (keyboard.toml);
+/// anything else refuses to clobber a curated file.
 fn write_macos_file(
     cfg: &Config,
     name: &str,
@@ -287,25 +288,13 @@ fn write_macos_file(
     overwrite: bool,
 ) -> Result<PathBuf> {
     let target = cfg.root.join("macos").join(format!("{name}.toml"));
-    if dry {
-        print!("{toml}");
-        ui::info(format!(
-            "(dry-run) would write {}",
-            crate::util::tildify(&target)
-        ));
-        return Ok(target);
-    }
-    if target.exists() && !overwrite {
+    if !dry && target.exists() && !overwrite {
         bail!(
             "{} already exists; pick another --output name, or use --dry-run and merge by hand",
             crate::util::tildify(&target)
         );
     }
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(&target, toml).with_context(|| format!("writing {}", target.display()))?;
+    crate::util::write_generated(&target, toml, dry)?;
     Ok(target)
 }
 
@@ -454,7 +443,7 @@ pub fn capture(ctx: &Ctx) -> Result<()> {
     ui::heading("packages.toml");
     let providers = pkg::registry(&cfg.packages);
     let selected: Vec<&dyn pkg::Provider> = providers.iter().map(|b| b.as_ref()).collect();
-    let _ = pkg::dump(&selected);
+    let _ = pkg::dump_toml(&selected);
     ui::heading("macos/keyboard.toml");
     match macos::keyboard::dump() {
         Ok(d) => print!("{}", macos::keyboard::to_toml(&d)),

@@ -1,7 +1,26 @@
 //! Small shared helpers with no better home.
 
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Write a generated file, creating parent directories as needed. On a dry run
+/// the body goes to stdout (data only) and the destination is announced on
+/// stderr, so `… --dry-run > file` still produces a clean file.
+///
+/// Every `dump` command lands here, so they can't drift apart.
+pub fn write_generated(target: &Path, body: &str, dry: bool) -> Result<()> {
+    if dry {
+        print!("{body}");
+        crate::ui::info(format!("(dry-run) would write {}", tildify(target)));
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(target, body).with_context(|| format!("writing {}", target.display()))
+}
 
 /// Expand a leading `~` or `~/` to the user's home directory. Paths without a
 /// leading tilde are returned unchanged.

@@ -38,6 +38,7 @@ packages.toml      brew / cargo / npm / pipx / go / custom providers
 macos/*.toml        per-domain defaults, command escape hatch, keybindings
 dotfiles/<pkg>/…    stow-style tree, mirrors $HOME
 profiles/*.toml     overlays merged onto the base for the active profile
+packages/<mgr>/…    output only: `pkg dump` snapshots in each manager's format
 ```
 
 ## Quick start
@@ -60,7 +61,8 @@ macboot diff  [--only dotfiles,packages,macos]          # detailed drift
 macboot link|unlink|relink [pkg…] [--dry-run]           # stow replacement
 macboot adopt --package <pkg> <file>…                   # pull ~/file into a package
 
-macboot pkg apply|diff|clean|dump [--provider …]        # multi-manager packages
+macboot pkg apply|diff|clean [--provider …]             # multi-manager packages
+macboot pkg dump [--provider …] [--dry-run]             # installed → packages/<mgr>/
 macboot pkg list                                        # providers + availability
 macboot brew …                                          # alias for pkg --provider brew
 
@@ -75,6 +77,34 @@ macboot doctor            (alias: verify)               # full self-check, non-z
 macboot capture                                         # snapshot machine → manifest form
 macboot completions <shell>
 ```
+
+## Packages
+
+`packages.toml` is the manifest `apply` reads. To go the other way, `pkg dump` snapshots
+what is actually installed into `packages/<manager>/`, each file in that manager's own
+format — so the output is usable by the manager itself, not just by macboot:
+
+```sh
+macboot pkg dump                     # every declared provider
+macboot pkg dump --provider brew     # just one
+macboot pkg dump --dry-run           # print to stdout, write nothing
+```
+
+```
+packages/brew/Brewfile            brew bundle --file=packages/brew/Brewfile
+packages/npm/package.json         globals as dependencies
+packages/mise/mise.toml           [tools], pinned to the installed version
+packages/pipx/requirements.txt    one app per line
+packages/cargo/crates.txt         xargs cargo install < packages/cargo/crates.txt
+packages/<custom>/packages.txt    one package per line
+```
+
+Each dump is a full re-render of what is installed, so it replaces the previous snapshot.
+These files are **outputs**: `apply` never reads them, and `packages.toml` stays the source
+of truth. Providers that can't enumerate what they installed (`go`, `nix`) are skipped.
+
+To move a snapshot back into the manifest, use `macboot capture`, which prints
+`packages.toml`-shaped blocks to stdout.
 
 ## macOS settings
 
@@ -107,7 +137,7 @@ macboot macos revert --domain com.apple.dock  # restore; keys that didn't exist 
 Revert always returns a key to the value it held *before macboot first touched it*, no matter
 how many `apply` runs happened in between.
 
-> Output convention: stdout carries only data (the TOML from `dump` and `capture`); all
+> Output convention: stdout carries only data (`capture`, and any `dump --dry-run`); all
 > progress and summary output goes to stderr, so `macboot macos dump --dry-run > macos/dock.toml`
 > produces a clean file.
 
