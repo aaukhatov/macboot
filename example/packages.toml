@@ -1,0 +1,31 @@
+# Homebrew is the default/primary provider; only declared providers are touched.
+[brew]
+enabled = true
+required = true
+taps = ["buo/cask-upgrade", "hashicorp/tap"]
+brews = ["bat", "eza", "fd", "fzf", "ripgrep", "starship", "zoxide", "git"]
+casks = ["iterm2", "raycast", "visual-studio-code"]
+mas = [{ name = "Amphetamine", id = 937984704 }]
+vscode = ["rust-lang.rust-analyzer"]
+
+# Optional categorization — informational, mirrors the old split Brewfiles.
+[brew.groups]
+cli = ["bat", "eza", "fd", "ripgrep"]
+
+# Language/ecosystem managers coexist with brew (distinct install prefixes).
+# Mark best-effort providers with required = false so a missing CLI only warns.
+[cargo]
+required = false
+crates = ["bottom", "tokei"]
+
+[npm]
+required = false
+globals = ["pnpm"]
+
+# A user-defined provider, wired up in pure TOML (no recompile needed).
+[providers.custom.gem]
+required = false
+list = ["gem", "list", "--no-versions"]
+install = ["gem", "install", "{pkg}"]
+remove = ["gem", "uninstall", "-x", "{pkg}"]
+packages = ["bundler"]

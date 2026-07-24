@@ -1,0 +1,9 @@
+# Overlay merged onto the base config when the rabobank profile is active.
+[packages.brew]
+brews = ["awscli"]
+
+# Extra dotfile packages to link for this profile.
+dotfiles = ["git"]
+
+[vars]
+git_email = "artur.aukhatov@rabobank.nl"

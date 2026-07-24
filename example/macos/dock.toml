@@ -1,0 +1,19 @@
+killall = ["Dock"]
+
+[[defaults]]
+domain = "com.apple.dock"
+key = "tilesize"
+type = "int"
+value = 36
+
+[[defaults]]
+domain = "com.apple.dock"
+key = "minimize-to-application"
+type = "bool"
+value = true
+
+[[defaults]]
+domain = "com.apple.dock"
+key = "show-recents"
+type = "bool"
+value = false

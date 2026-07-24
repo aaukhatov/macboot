@@ -1,0 +1,17 @@
+[meta]
+name = "artur-macbook"
+
+[profile]
+# First matching rule wins; replaces the $USER case in the old .zshenv.
+default = "personal"
+match = [{ profile = "rabobank", username = "Artur.Aukhatov" }]
+
+[apply]
+# Stage order + failure policy. `continue` mirrors the old `run` helper.
+stages = ["packages", "dotfiles", "macos"]
+on_error = "continue"
+
+# Optional: pin which dotfile packages to link. Omit to link every directory
+# found under dotfiles/.
+[dotfiles]
+packages = ["git", "zsh"]

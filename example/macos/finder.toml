@@ -1,0 +1,25 @@
+killall = ["Finder"]
+
+[[defaults]]
+domain = "com.apple.finder"
+key = "AppleShowAllFiles"
+type = "bool"
+value = true
+
+[[defaults]]
+domain = "com.apple.finder"
+key = "FXPreferredViewStyle"
+type = "string"
+value = "Nlsv"
+
+[[defaults]]
+domain = "com.apple.finder"
+key = "ShowPathbar"
+type = "bool"
+value = true
+
+# The command escape hatch for things `defaults` can't express.
+[[command]]
+desc = "Enable lid wakeup"
+run = ["sudo", "pmset", "-a", "lidwake", "1"]
+sudo = true

@@ -1,0 +1,9 @@
+[user]
+	name = Artur Aukhatov
+	email = aaukhatov@gmail.com
+
+[init]
+	defaultBranch = main
+
+[core]
+	editor = vim

@@ -1,0 +1,36 @@
+# System hotkeys (com.apple.symbolichotkeys). Replaces keyboard-bindings.xml.
+# Regenerate from the live machine any time with: macboot keyboard dump
+apply = "activateSettings"
+
+[[hotkey]]
+action = "spotlight"
+enabled = true
+chord = "cmd+space"
+
+[[hotkey]]
+action = "mission-control"
+enabled = true
+chord = "ctrl+up"
+
+[[hotkey]]
+action = "screenshot-to-file"
+enabled = true
+chord = "cmd+shift+3"
+
+[[hotkey]]
+action = "spotlight-finder-search"
+enabled = false
+
+# Escape hatch for IDs without a friendly name (e.g. a QMK-layer bind).
+[[raw]]
+id = 184
+enabled = true
+key = "5"
+keycode = 23
+mods = ["cmd", "shift"]
+
+# Per-app menu shortcut (NSUserKeyEquivalents).
+[[app_shortcut]]
+bundle = "com.apple.Safari"
+menu_title = "Merge All Windows"
+chord = "cmd+shift+m"
