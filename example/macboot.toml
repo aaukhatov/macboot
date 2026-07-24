@@ -1,10 +1,10 @@
 [meta]
-name = "artur-macbook"
+name = "arturito"
 
 [profile]
 # First matching rule wins; replaces the $USER case in the old .zshenv.
 default = "personal"
-match = [{ profile = "rabobank", username = "Artur.Aukhatov" }]
+match = [{ profile = "work", username = "Artur.Aukhatov" }]
 
 [apply]
 # Stage order + failure policy. `continue` mirrors the old `run` helper.

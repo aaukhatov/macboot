@@ -6,4 +6,4 @@ brews = ["awscli"]
 dotfiles = ["git"]
 
 [vars]
-git_email = "artur.aukhatov@rabobank.nl"
+git_email = "artur.aukhatov@work.com"
