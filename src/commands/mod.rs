@@ -272,60 +272,83 @@ pub fn macos_diff(ctx: &Ctx, only: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub fn macos_record(ctx: &Ctx, domains: &[String], output: Option<&str>, all: bool) -> Result<()> {
+/// Default file for `macos dump` when `--output` is not given.
+const DEFAULT_DUMP_NAME: &str = "settings";
+
+/// Write generated TOML to `<config>/macos/<name>.toml`, or print it on a dry
+/// run. Data goes to stdout and commentary to stderr, so `--dry-run > file`
+/// still produces a clean file. `overwrite` is for files the dump owns end to
+/// end (keyboard.toml); anything else refuses to clobber a curated file.
+fn write_macos_file(
+    cfg: &Config,
+    name: &str,
+    toml: &str,
+    dry: bool,
+    overwrite: bool,
+) -> Result<PathBuf> {
+    let target = cfg.root.join("macos").join(format!("{name}.toml"));
+    if dry {
+        print!("{toml}");
+        ui::info(format!(
+            "(dry-run) would write {}",
+            crate::util::tildify(&target)
+        ));
+        return Ok(target);
+    }
+    if target.exists() && !overwrite {
+        bail!(
+            "{} already exists; pick another --output name, or use --dry-run and merge by hand",
+            crate::util::tildify(&target)
+        );
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&target, toml).with_context(|| format!("writing {}", target.display()))?;
+    Ok(target)
+}
+
+pub fn macos_dump(
+    ctx: &Ctx,
+    domains: &[String],
+    output: Option<&str>,
+    all: bool,
+    dry: bool,
+) -> Result<()> {
     let cfg = ctx.load()?;
-    let changes = macos::record::record(domains, all)?;
+    let changes = macos::dump::dump(domains, all)?;
     if changes.is_empty() {
         ui::warn("No settings changed between the two snapshots.");
         ui::detail("If you did change something, re-run with --all to include filtered keys.");
         return Ok(());
     }
-    ui::ok(format!("Recorded {} changed key(s)", changes.len()));
+    ui::ok(format!("Captured {} changed key(s)", changes.len()));
 
-    let toml = macos::record::to_toml(&changes);
-    let Some(name) = output else {
-        // Data on stdout, commentary on stderr, so `> file` stays clean.
-        print!("{toml}");
-        return Ok(());
-    };
-
-    let target = cfg.root.join("macos").join(format!("{name}.toml"));
-    if target.exists() {
-        bail!(
-            "{} already exists; pick another --output name or merge by hand",
-            crate::util::tildify(&target)
-        );
+    let name = output.unwrap_or(DEFAULT_DUMP_NAME);
+    let toml = macos::dump::to_toml(&changes);
+    let target = write_macos_file(&cfg, name, &toml, dry, false)?;
+    if !dry {
+        ui::ok(format!("Wrote {}", crate::util::tildify(&target)));
+        ui::detail(format!("Review it, then: macboot macos diff --only {name}"));
     }
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&target, toml).with_context(|| format!("writing {}", target.display()))?;
-    ui::ok(format!("Wrote {}", crate::util::tildify(&target)));
-    ui::detail(format!("Review it, then: macboot macos diff --only {name}"));
     Ok(())
 }
 
-pub fn keyboard_dump(ctx: &Ctx, stdout: bool, dry: bool) -> Result<()> {
+pub fn keyboard_dump(ctx: &Ctx, dry: bool) -> Result<()> {
     let cfg = ctx.load()?;
     let dumped = macos::keyboard::dump()?;
     let toml = macos::keyboard::to_toml(&dumped);
-    let target = cfg.root.join("macos").join("keyboard.toml");
-    if stdout || dry {
-        print!("{toml}");
-        if dry {
-            ui::info(format!("(dry-run) would write {}", target.display()));
-        }
-        return Ok(());
+    // keyboard.toml is a full re-render of the live domain, not a diff, so a
+    // dump always replaces it.
+    let target = write_macos_file(&cfg, "keyboard", &toml, dry, true)?;
+    if !dry {
+        ui::ok(format!(
+            "Wrote {} hotkey entries to {}",
+            dumped.len(),
+            crate::util::tildify(&target)
+        ));
     }
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&target, toml)?;
-    ui::ok(format!(
-        "Wrote {} hotkey entries to {}",
-        dumped.len(),
-        crate::util::tildify(&target)
-    ));
     Ok(())
 }
 

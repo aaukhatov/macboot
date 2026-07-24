@@ -110,10 +110,15 @@ replays — a key that did not exist is deleted, one that did is written back wi
 type. Later applies never overwrite the recorded original, so revert always reaches the
 pre-macboot state.
 
-`macos/record.rs` is the discovery half: it exports every domain (8 scoped threads, ~3s for 736
-domains), waits on `ui::pause`, exports again, and renders the diff as `[[defaults]]` blocks.
-Churn keys are filtered via `NOISY_KEY_FRAGMENTS`/`NOISY_DOMAINS`; shapes that `[[defaults]]`
-cannot express become comments so the output always parses back into a `MacosFile`.
+`macos/dump.rs` is the discovery half (`macos dump`): it exports every domain (8 scoped threads,
+~3s for 736 domains), waits on `ui::pause`, exports again, and renders the diff as `[[defaults]]`
+blocks. Churn keys are filtered via `NOISY_KEY_FRAGMENTS`/`NOISY_DOMAINS`; shapes that
+`[[defaults]]` cannot express become comments so the output always parses back into a `MacosFile`.
+
+Both dumps (`macos dump`, `keyboard dump`) write through `commands::write_macos_file`: a real run
+writes `macos/<name>.toml`, `--dry-run` prints the TOML to stdout instead. `keyboard dump` owns
+`keyboard.toml` (a full re-render) and overwrites it; `macos dump` emits a diff and so refuses to
+clobber an existing file.
 
 `macos/keyboard.rs` translates both directions between the opaque `com.apple.symbolichotkeys` plist
 (`parameters = [ascii, keycode, modifierMask]`) and friendly `action`/`chord` TOML. `ACTIONS` and
@@ -130,9 +135,9 @@ data. `apply` writes a temp plist, `defaults import`s it, then runs `activateSet
 - **All user-visible output goes through `ui.rs`** (`info`/`warn`/`err`/`ok`/`detail`/`heading`).
   `Summary::record` both counts an outcome *and* prints its line — don't print the line separately.
   Failures are collected and re-printed by `render()`.
-- **`ui.rs` writes to stderr; stdout is data only.** The TOML from `pkg dump`, `macos record`,
-  `keyboard dump`, and `capture` is the only thing on stdout, so `… > macos/dock.toml` works.
-  Never `println!` commentary.
+- **`ui.rs` writes to stderr; stdout is data only.** The TOML from `pkg dump`, `capture`, and the
+  `--dry-run` form of `macos dump`/`keyboard dump` is the only thing on stdout, so
+  `… --dry-run > macos/dock.toml` works. Never `println!` commentary.
 - **Anything `dump`-like must round-trip.** Output is fed straight back into a manifest, so it
   has to parse into the same struct that produced it — hence `Provider::dump_block` (brew
   overrides it to emit `taps`/`brews`/`casks` rather than a key `BrewSpec` would ignore) and

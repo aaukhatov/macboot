@@ -177,18 +177,22 @@ enum MacosCmd {
         #[arg(long)]
         only: Option<String>,
     },
-    /// Snapshot, wait while you change System Settings, then print the diff as
-    /// ready-to-paste `[[defaults]]` TOML.
-    Record {
+    /// Snapshot, wait while you change System Settings, then write the diff as
+    /// `[[defaults]]` TOML to macos/<NAME>.toml.
+    #[command(alias = "record")]
+    Dump {
         /// Limit the snapshot to these domains (repeatable, much faster).
         #[arg(long, value_name = "DOMAIN")]
         domain: Vec<String>,
-        /// Write to macos/<NAME>.toml instead of stdout.
+        /// File to write, as macos/<NAME>.toml (default: settings).
         #[arg(long, value_name = "NAME")]
         output: Option<String>,
         /// Include keys macboot filters as churn (window frames, recents, ...).
         #[arg(long)]
         all: bool,
+        /// Print to stdout instead of writing the file.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Restore defaults macboot has changed to their pre-macboot values.
     Revert {
@@ -205,8 +209,6 @@ enum KeyboardCmd {
     /// Reverse the live symbolichotkeys domain into macos/keyboard.toml.
     Dump {
         /// Print to stdout instead of writing the file.
-        #[arg(long)]
-        stdout: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -271,17 +273,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 commands::macos_apply(&ctx, only.as_deref(), dry_run)
             }
             MacosCmd::Diff { only } => commands::macos_diff(&ctx, only.as_deref()),
-            MacosCmd::Record {
+            MacosCmd::Dump {
                 domain,
                 output,
                 all,
-            } => commands::macos_record(&ctx, &domain, output.as_deref(), all),
+                dry_run,
+            } => commands::macos_dump(&ctx, &domain, output.as_deref(), all, dry_run),
             MacosCmd::Revert { domain, dry_run } => {
                 commands::macos_revert(&ctx, domain.as_deref(), dry_run)
             }
         },
         Command::Keyboard { cmd } => match cmd {
-            KeyboardCmd::Dump { stdout, dry_run } => commands::keyboard_dump(&ctx, stdout, dry_run),
+            KeyboardCmd::Dump { dry_run } => commands::keyboard_dump(&ctx, dry_run),
             KeyboardCmd::Apply { dry_run } => commands::keyboard_apply(&ctx, dry_run),
         },
 

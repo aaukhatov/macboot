@@ -2,8 +2,8 @@
 //! keybindings, and per-app menu shortcuts. Every setting is read before it is
 //! written, so `apply` is idempotent and `diff` shows real drift.
 
+pub mod dump;
 pub mod keyboard;
-pub mod record;
 
 use crate::config::{Config, DefaultSetting, DefaultType, MacosFile};
 use crate::proc;

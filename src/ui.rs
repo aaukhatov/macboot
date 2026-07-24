@@ -2,8 +2,9 @@
 //! Port of the `info/warn/err/ok/ask` helpers from the original `utils.sh`.
 //!
 //! Everything here writes to **stderr**. Stdout carries only data — the TOML
-//! emitted by `pkg dump`, `macos record`, `keyboard dump`, and `capture` — so
-//! that `macboot macos record > macos/dock.toml` produces a usable file.
+//! emitted by `pkg dump`, `macos dump --dry-run`, `keyboard dump --dry-run`,
+//! and `capture` — so that `macboot pkg dump > packages.toml` produces a
+//! usable file.
 
 use owo_colors::{OwoColorize, Stream::Stderr};
 use std::io::{self, IsTerminal, Write};
