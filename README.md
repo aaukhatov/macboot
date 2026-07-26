@@ -71,6 +71,7 @@ macboot brew …                                                 # alias for pkg
 macboot macos apply [--only dock,finder,…] [--dry-run]  # apply declarative defaults
 macboot macos diff  [--only dock,finder,…]              # drift vs. current defaults
 macboot macos dump [--domain …] [--output NAME] [--dry-run]  # System Settings → TOML
+macboot macos get <domain> [key] [--keys] [--managed]   # read live values (alias: read)
 macboot macos revert [--domain …] [--dry-run]           # undo defaults macboot wrote
 macboot keyboard dump [--dry-run]                       # reverse symbolichotkeys → TOML
 macboot keyboard apply [--dry-run]                      # import keybindings + reload
@@ -150,6 +151,40 @@ macboot macos revert --domain com.apple.dock  # restore; keys that didn't exist 
 
 Revert always returns a key to the value it held *before macboot first touched it*, no matter
 how many `apply` runs happened in between.
+
+### Reading a value
+
+`macos get` is the read-only counterpart to `dump` — no noise filter, no before/after, no file
+written. It prints both host scopes, so a ByHost key can't hide:
+
+```sh
+macboot macos get com.apple.dock              # every key, as TOML, both scopes
+macboot macos get com.apple.dock tilesize     # just the value, for `$(…)` capture
+macboot macos get com.apple.dock --keys       # key names only, comment-free for xargs
+macboot macos get com.apple.dock --managed    # only keys an MDM profile forces
+```
+
+A single-key read prints the bare value on stdout and nothing else, so it can be captured
+directly; missing keys exit non-zero rather than printing an empty line.
+
+### Managed (MDM) preferences
+
+On a Mac enrolled in an MDM, a configuration profile can *force* a preference. Forced values
+live in `/Library/Managed Preferences` and are layered over your own domain when an app reads
+a setting — so `defaults write` appears to succeed while changing nothing the app can see.
+
+macboot reads those profiles and treats a forced key as **skipped, not drift**:
+
+```
+  - com.apple.dock tilesize (forced to 64 by configuration profile)
+    an MDM configuration profile owns this key; remove it from the config or change it in the profile
+```
+
+The key is never written, so it never lands in the state file and `revert` never sees a change
+that didn't happen. A forced key that already holds your declared value simply reports as
+unchanged. `doctor` lists any declared key a profile overrides — advisory, so it doesn't fail
+CI. Set `$MACBOOT_MANAGED_PREFS` to point the lookup at another directory (useful for testing
+this path on a machine that isn't enrolled).
 
 > Output convention: stdout carries only data (`capture`, and any `dump --dry-run`); all
 > progress and summary output goes to stderr, so `macboot macos dump --dry-run > macos/dock.toml`

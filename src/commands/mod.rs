@@ -266,6 +266,13 @@ pub fn macos_revert(ctx: &Ctx, domain: Option<&str>, dry: bool) -> Result<()> {
     Ok(())
 }
 
+/// `macos get`: read-only inspection. Needs no config, and writes the values to
+/// stdout so they can be piped or captured.
+pub fn macos_get(domain: &str, key: Option<&str>, keys: bool, managed: bool) -> Result<()> {
+    print!("{}", macos::get(domain, key, keys, managed)?);
+    Ok(())
+}
+
 pub fn macos_diff(ctx: &Ctx, only: Option<&str>) -> Result<()> {
     let cfg = ctx.load()?;
     let filter = split_only(only);
@@ -451,6 +458,20 @@ pub fn doctor(ctx: &Ctx) -> Result<()> {
         ui::detail(
             "grant it in System Settings → Privacy & Security → Full Disk Access, or \
              `macos dump`/`apply` may silently skip some protected domains",
+        );
+    }
+
+    // Advisory too: a profile-forced key can never be applied, so declaring one
+    // is a config mistake — but not one that should fail a build.
+    let forced = macos::forced_conflicts(&cfg);
+    for conflict in &forced {
+        ui::warn(conflict);
+        summary.record(Status::Skipped, conflict);
+    }
+    if !forced.is_empty() {
+        ui::detail(
+            "an MDM configuration profile forces these keys; macboot cannot change them, \
+             so drop them from the config or change them in the profile",
         );
     }
 

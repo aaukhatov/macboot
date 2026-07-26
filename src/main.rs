@@ -233,6 +233,21 @@ enum MacosCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Print the live value of a domain (or one key) to stdout, in both host
+    /// scopes, flagging keys forced by an MDM configuration profile.
+    #[command(alias = "read")]
+    Get {
+        /// Preference domain, e.g. com.apple.dock or NSGlobalDomain.
+        domain: String,
+        /// Read only this key. Prints the bare value, for use in scripts.
+        key: Option<String>,
+        /// List key names only, without their values.
+        #[arg(long)]
+        keys: bool,
+        /// Restrict the output to keys forced by a configuration profile.
+        #[arg(long)]
+        managed: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -315,6 +330,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             MacosCmd::Revert { domain, dry_run } => {
                 commands::macos_revert(&ctx, domain.as_deref(), dry_run)
             }
+            MacosCmd::Get {
+                domain,
+                key,
+                keys,
+                managed,
+            } => commands::macos_get(&domain, key.as_deref(), keys, managed),
         },
         Command::Keyboard { cmd } => match cmd {
             KeyboardCmd::Dump { dry_run } => commands::keyboard_dump(&ctx, dry_run),

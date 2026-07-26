@@ -145,6 +145,37 @@ Comparison is `value::equal`, not `==`: `defaults` stores the same setting as `1
 Dict comparison ignores key order. `Real(1.0)` renders as `1.0`, never bare `1`, or it would parse
 back as an integer and fail its own type check.
 
+#### Managed preferences (`macos/managed.rs`)
+
+An MDM configuration profile materializes preferences into `/Library/Managed Preferences`, and
+macOS layers those *over* the user domain at read time. `export_domain` reads a single plist and
+therefore cannot see them, which makes a forced key look like permanent drift: `apply` writes it
+successfully every run and the effective value never moves. `Managed` reads those plists directly
+(world-readable, no Full Disk Access, no Objective-C bridge) — the cheap equivalent of
+`UserDefaults.objectIsForced(forKey:)`.
+
+`evaluate` (which replaced `is_in_sync`) checks the profile *first* and returns a `Resolved`:
+`Matches` / `Drifted` / `Forced(value)`. Forced keys are recorded as `Status::Skipped` and never
+written — which also keeps them out of the state file, so `revert` never carries a record for a
+change that never happened. A forced key already holding the declared value is just `Matches`.
+Comparison goes through `value::equal` for the same reason live reads do. `forced_conflicts`
+feeds `doctor` (advisory: skipped, not failed).
+
+Managed values are keyed by domain only — a profile has no ByHost variant — so lookups
+deliberately ignore `HostScope`. Device-level `<domain>.plist` is merged first and the
+user-scoped `<user>/<domain>.plist` layered on top, matching CFPreferences precedence.
+`$MACBOOT_MANAGED_PREFS` overrides the root (as `$MACBOOT_STATE` does for state), which is the
+only way to exercise these paths on an unenrolled machine; tests use `Managed::with_root`.
+
+#### Reading values (`macos::get`)
+
+`macos get` is the read-only inspection path: it loads no config (so it works before `init`),
+prints TOML on stdout, exports each scope exactly once, and marks keys a profile overrides.
+`--keys` output is deliberately comment-free and deduplicated across scopes, following the same
+xargs-friendly rule as the `pkg dump` list files; the value form keeps `# <domain>` scope
+headings. Empty results are an error, and `--managed` says *why* it found nothing rather than
+implying the domain is unreadable.
+
 #### Host scope
 
 macOS keeps some preferences per-user and some per-user-*and*-machine (`~/Library/Preferences/ByHost`,
