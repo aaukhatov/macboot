@@ -114,19 +114,71 @@ idempotent and `diff` meaningful. A `macos/*.toml` file may contain `[[defaults]
 `killall` targets are deduplicated across all files and run once at the end of `apply` — but only
 for files that actually changed something, since restarting Dock/Finder is user-visible.
 
+Reads go through `Store`, which runs `defaults export` **per domain** and caches the result for the
+run, rather than `defaults read` per key. Two reasons, and the second is the important one: a file
+with 20 keys across 2 domains costs 2 processes instead of 20, and the XML export yields the real
+`plist::Value` — `defaults read` renders arrays and dicts as old-style text that cannot be parsed
+back. `Store::invalidate` is called after each write so a later read in the same run can't see a
+stale value.
+
 `--only` names are validated against the files that exist (`selected_files` returns `Result`): a
 mistyped filter must never look like a successful no-op.
 
-`macos::apply` takes `&mut State`. Before the *first* write to any key it records that key's
-previous value and `defaults read-type` into `state.defaults`, which is what `macos revert`
-replays — a key that did not exist is deleted, one that did is written back with its original
-type. Later applies never overwrite the recorded original, so revert always reaches the
-pre-macboot state.
+#### Value types (`macos/value.rs`)
 
-`macos/dump.rs` is the discovery half (`macos dump`): it exports every domain (8 scoped threads,
-~3s for 736 domains), waits on `ui::pause`, exports again, and renders the diff as `[[defaults]]`
-blocks. Churn keys are filtered via `NOISY_KEY_FRAGMENTS`/`NOISY_DOMAINS`; shapes that
-`[[defaults]]` cannot express become comments so the output always parses back into a `MacosFile`.
+`type =` covers `bool`/`int`/`float`/`string` plus `array`/`dict`/`data`/`date`. Scalars are written
+with their `defaults` flag (`-int`, `-bool`, …) so the command matches what a user would type;
+everything else is written by passing an **XML plist document** as the value, which is the only form
+`defaults write` accepts for a complex type.
+
+Two rules keep the two directions honest:
+
+- Inside an array or dict there is no `type =`, so element types are **inferred from the TOML
+  shape**. TOML has no binary type, so a plist `<data>` round-trips as a string tagged with
+  `value::DATA_PREFIX` (`"base64:…"`) — that prefix is the only thing keeping nested data from
+  decaying into a plain string.
+- Dictionaries render as **single-line** TOML inline tables (TOML forbids newlines inside one), so
+  `render` flattens any nested array it contains. Arrays may span lines.
+
+Comparison is `value::equal`, not `==`: `defaults` stores the same setting as `1` or `1.0`, and as
+`true` or `1`, so plain equality would report permanent drift and rewrite the key on every apply.
+Dict comparison ignores key order. `Real(1.0)` renders as `1.0`, never bare `1`, or it would parse
+back as an integer and fail its own type check.
+
+#### Host scope
+
+macOS keeps some preferences per-user and some per-user-*and*-machine (`~/Library/Preferences/ByHost`,
+reached with `defaults -currentHost`) — Control Center's menu bar layout and screensaver settings are
+ByHost. An unscoped read simply cannot see them, so `HostScope` travels with every setting via
+`host = "current"` and is threaded through read, write, delete, dump and state. The same domain+key
+is a *different* setting in each store; `HostScope::suffix()` keeps them apart in state keys and
+labels, and returns `""` for the default scope so pre-existing state files still match.
+
+#### State and revert
+
+`macos::apply` takes `&mut State`. Before the *first* write to any key it archives that key's whole
+previous value as an **XML plist** in `DefaultRecord::previous_plist`, which is what `macos revert`
+replays — a key that did not exist is deleted, one that did is written back exactly. Archiving the
+plist rather than `defaults read` text is what makes arrays and dicts revertable at all; the old
+text capture had no faithful one-line form for them and revert had to give up with "restore it by
+hand". Later applies never overwrite the recorded original, so revert always reaches the pre-macboot
+state.
+
+`previous`/`previous_type` are the legacy fields, still **read** for state files written before the
+XML archive but never written; `flag_for_type` exists only to serve them.
+
+`macos::validate` type-checks every `value =` against its `type =` without touching the machine, and
+`doctor` reports the result alongside `Config::validate` — a typo should surface before `apply`
+leaves a file half-applied. `diff`/`apply` record such a setting as `Failed`, never as drift.
+
+#### Dump
+
+`macos/dump.rs` is the discovery half (`macos dump`): it exports every domain in **both host scopes**
+(8 scoped threads, ~3s for 736 domains), waits on `ui::pause`, exports again, and renders the diff as
+`[[defaults]]` blocks — emitting `host = "current"` only for ByHost keys. Churn keys are filtered via
+`NOISY_KEY_FRAGMENTS`/`NOISY_DOMAINS`. The output must parse back into a `MacosFile` *and* re-parse
+into the value it came from; the `assert_dump_round_trips` helper is what pins that down. Shapes with
+no plist equivalent still become comments rather than broken TOML.
 
 Both dumps (`macos dump`, `keyboard dump`) write through `commands::write_macos_file`: a real run
 writes `macos/<name>.toml`, `--dry-run` prints the TOML to stdout instead. `keyboard dump` owns
@@ -159,6 +211,9 @@ data. `apply` writes a temp plist, `defaults import`s it, then runs `activateSet
   produced it — hence `Provider::dump_block` (brew overrides it to emit `taps`/`brews`/`casks`
   rather than a key `BrewSpec` would ignore) and `#[serde(deny_unknown_fields)]` on every spec in
   `config/packages.rs`. The native `pkg dump` files round-trip into *their own manager* instead.
+  For `macos dump` the bar is higher than parsing: the emitted block must re-parse into the *same
+  plist value* it was rendered from, since a dump that quietly alters a value stops describing the
+  machine it came from.
 - **Errors use `anyhow` with `.context()`** naming the path or command involved; `main` prints
   `{e:#}` and exits 1.
 - Exit codes are load-bearing: `pkg diff` exits 1 on drift and `doctor` exits 1 on failure so they

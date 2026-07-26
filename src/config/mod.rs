@@ -168,6 +168,10 @@ pub struct DefaultSetting {
     /// Write with sudo (system domains under /Library).
     #[serde(default)]
     pub sudo: bool,
+    /// Which preference store the key lives in. Defaults to the normal
+    /// per-user store; `"current"` selects the per-machine ByHost store.
+    #[serde(default)]
+    pub host: HostScope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -177,6 +181,52 @@ pub enum DefaultType {
     Int,
     Float,
     String,
+    /// A plist array. The TOML value is an array; element types are inferred.
+    Array,
+    /// A plist dictionary. The TOML value is a table; value types are inferred.
+    Dict,
+    /// A plist data blob, written as a base64 TOML string.
+    Data,
+    /// A plist date, written as a TOML datetime or an RFC 3339 string.
+    Date,
+}
+
+/// Which of the two `defaults` preference stores a key lives in.
+///
+/// macOS keeps some preferences per-user (`~/Library/Preferences`) and some
+/// per-user-*and*-machine (`~/Library/Preferences/ByHost`, reached with
+/// `defaults -currentHost`). Control Center's menu bar layout and screensaver
+/// settings are ByHost, and are simply invisible to an unscoped read — so the
+/// scope has to travel with every setting.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum HostScope {
+    /// `~/Library/Preferences` — the default.
+    #[default]
+    Any,
+    /// `defaults -currentHost`, i.e. the ByHost store for this machine.
+    Current,
+}
+
+impl HostScope {
+    /// The flag `defaults` needs, as a leading argv element.
+    pub fn args(self) -> &'static [&'static str] {
+        match self {
+            HostScope::Any => &[],
+            HostScope::Current => &["-currentHost"],
+        }
+    }
+
+    /// Short suffix used in labels and state keys. Empty for the default scope
+    /// so existing state files keep matching.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            HostScope::Any => "",
+            HostScope::Current => " @currentHost",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

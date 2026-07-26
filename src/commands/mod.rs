@@ -378,7 +378,7 @@ pub fn doctor(ctx: &Ctx, _fix: bool) -> Result<()> {
             bail!("config could not be loaded");
         }
     };
-    for problem in cfg.validate() {
+    for problem in cfg.validate().into_iter().chain(macos::validate(&cfg)) {
         ui::warn(&problem);
         summary.record(Status::Failed, &problem);
     }

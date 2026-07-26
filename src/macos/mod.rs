@@ -4,43 +4,98 @@
 
 pub mod dump;
 pub mod keyboard;
+pub mod value;
 
-use crate::config::{Config, DefaultSetting, DefaultType, MacosFile};
+use crate::config::{Config, DefaultSetting, DefaultType, HostScope, MacosFile};
 use crate::proc;
 use crate::state::{DefaultRecord, State};
 use crate::ui::{self, Status, Summary};
-use anyhow::{bail, Result};
-use std::collections::BTreeSet;
+use anyhow::{bail, Context, Result};
+use std::collections::{BTreeMap, BTreeSet};
 
-/// Read the current value of a default, or None if unset.
-fn read_default(setting: &DefaultSetting) -> Option<String> {
-    proc::capture("defaults", &["read", &setting.domain, &setting.key])
-        .ok()
-        .filter(|o| o.success())
-        .map(|o| o.stdout.trim().to_string())
+/// Live preference values, read through `defaults export` and cached per run.
+///
+/// Reading a whole domain at once rather than a key at a time matters twice
+/// over: a file with twenty keys in two domains costs two processes instead of
+/// twenty, and the XML gives us the real plist value — including arrays and
+/// dicts, which `defaults read` only renders as un-reparseable old-style text.
+#[derive(Default)]
+struct Store {
+    cache: BTreeMap<(String, HostScope), Option<BTreeMap<String, plist::Value>>>,
 }
 
-/// Does the live value already match the desired value?
-fn is_in_sync(setting: &DefaultSetting) -> bool {
-    let Some(current) = read_default(setting) else {
-        return false;
-    };
-    match setting.kind {
-        DefaultType::Bool => {
-            let want = setting.value.as_bool().unwrap_or(false);
-            let got = matches!(current.as_str(), "1" | "true" | "YES");
-            want == got
-        }
-        DefaultType::Int => setting.value.as_integer() == current.trim().parse::<i64>().ok(),
-        DefaultType::Float => match (setting.value.as_float(), current.trim().parse::<f64>()) {
-            (Some(w), Ok(g)) => (w - g).abs() < f64::EPSILON,
-            _ => false,
-        },
-        DefaultType::String => setting.value.as_str() == Some(current.as_str()),
+impl Store {
+    fn new() -> Store {
+        Store::default()
+    }
+
+    /// The live value of one key, or None if the domain or key is absent.
+    fn read(&mut self, domain: &str, key: &str, host: HostScope) -> Option<plist::Value> {
+        self.cache
+            .entry((domain.to_string(), host))
+            .or_insert_with(|| export_domain(domain, host))
+            .as_ref()
+            .and_then(|keys| keys.get(key).cloned())
+    }
+
+    /// Drop a cached domain after writing to it, so a later read in the same
+    /// run cannot see a stale value.
+    fn invalidate(&mut self, domain: &str, host: HostScope) {
+        self.cache.remove(&(domain.to_string(), host));
     }
 }
 
-/// Build the `defaults write` argv value flag + string for a setting.
+/// Read one domain in one scope into a key → value map. A domain that cannot be
+/// exported (absent, sandboxed, malformed) yields None.
+pub fn export_domain(domain: &str, host: HostScope) -> Option<BTreeMap<String, plist::Value>> {
+    let mut args = host.args().to_vec();
+    args.extend_from_slice(&["export", domain, "-"]);
+    let out = proc::capture("defaults", &args).ok()?;
+    if !out.success() {
+        return None;
+    }
+    let parsed = plist::Value::from_reader_xml(std::io::Cursor::new(out.stdout.as_bytes())).ok()?;
+    let dict = parsed.into_dictionary()?;
+    Some(dict.into_iter().collect())
+}
+
+/// The plist value a setting wants the key to hold.
+fn desired(setting: &DefaultSetting) -> Result<plist::Value> {
+    value::to_plist(setting.kind, &setting.value).with_context(|| {
+        format!(
+            "in [[defaults]] for {} {}",
+            setting.domain,
+            label_key(setting)
+        )
+    })
+}
+
+/// Does the live value already match the desired value?
+fn is_in_sync(setting: &DefaultSetting, store: &mut Store) -> Result<bool> {
+    let want = desired(setting)?;
+    let Some(current) = store.read(&setting.domain, &setting.key, setting.host) else {
+        return Ok(false);
+    };
+    Ok(value::equal(&want, &current))
+}
+
+/// Run a `defaults` subcommand in the right scope, with sudo if required.
+fn run_defaults(sudo: bool, host: HostScope, args: &[&str]) -> Result<()> {
+    let mut argv = host.args().to_vec();
+    argv.extend_from_slice(args);
+    if sudo {
+        let mut with_sudo = vec!["defaults"];
+        with_sudo.extend_from_slice(&argv);
+        proc::run("sudo", &with_sudo)
+    } else {
+        proc::run("defaults", &argv)
+    }
+}
+
+/// The `defaults write` value flag + argument for a scalar setting.
+///
+/// Scalars keep their typed flags rather than going through XML so that the
+/// command macboot runs stays the one a user would type by hand.
 fn write_value(setting: &DefaultSetting) -> (&'static str, String) {
     match setting.kind {
         DefaultType::Bool => (
@@ -60,50 +115,67 @@ fn write_value(setting: &DefaultSetting) -> (&'static str, String) {
             "-string",
             setting.value.as_str().unwrap_or_default().to_string(),
         ),
+        // Complex types have no flag; write_default sends XML instead.
+        DefaultType::Array | DefaultType::Dict | DefaultType::Data | DefaultType::Date => {
+            ("", String::new())
+        }
     }
-}
-
-/// The plist type of a live key, per `defaults read-type` ("boolean", "integer",
-/// "string", …). None if the key does not exist.
-fn read_type(domain: &str, key: &str) -> Option<String> {
-    let out = proc::capture("defaults", &["read-type", domain, key]).ok()?;
-    if !out.success() {
-        return None;
-    }
-    // Output is literally "Type is boolean".
-    out.stdout
-        .trim()
-        .rsplit(' ')
-        .next()
-        .map(|s| s.to_lowercase())
 }
 
 /// Remember what a key held before macboot first writes it, so `macos revert`
 /// can put it back. Subsequent writes do not overwrite the original.
-fn remember_previous(state: &mut State, setting: &DefaultSetting) {
-    if state.knows_default(&setting.domain, &setting.key) {
+fn remember_previous(state: &mut State, setting: &DefaultSetting, store: &mut Store) {
+    if state.knows_default(&setting.domain, &setting.key, setting.host) {
         return;
     }
+    // Archive the whole plist value, not `defaults read`'s flattened text, so
+    // an array or dict can actually be put back.
+    let previous = store
+        .read(&setting.domain, &setting.key, setting.host)
+        .and_then(|v| value::to_xml(&v).ok());
     state.insert_default(DefaultRecord {
         domain: setting.domain.clone(),
         key: setting.key.clone(),
-        previous: read_default(setting),
-        previous_type: read_type(&setting.domain, &setting.key),
+        previous_plist: previous,
+        previous: None,
+        previous_type: None,
         sudo: setting.sudo,
+        host: setting.host,
         recorded: crate::util::now_stamp(),
     });
 }
 
 fn write_default(setting: &DefaultSetting) -> Result<()> {
-    let (flag, value) = write_value(setting);
-    let args = ["write", &setting.domain, &setting.key, flag, &value];
-    if setting.sudo {
-        let mut sudo_args = vec!["defaults"];
-        sudo_args.extend_from_slice(&args);
-        proc::run("sudo", &sudo_args)
-    } else {
-        proc::run("defaults", &args)
+    match setting.kind {
+        DefaultType::Bool | DefaultType::Int | DefaultType::Float | DefaultType::String => {
+            let (flag, value) = write_value(setting);
+            run_defaults(
+                setting.sudo,
+                setting.host,
+                &["write", &setting.domain, &setting.key, flag, &value],
+            )
+        }
+        // `defaults write` parses an XML plist document as the value, which is
+        // the only way to set an array, dict, data blob or date.
+        _ => {
+            let xml = value::to_xml(&desired(setting)?)?;
+            run_defaults(
+                setting.sudo,
+                setting.host,
+                &["write", &setting.domain, &setting.key, &xml],
+            )
+        }
     }
+}
+
+/// The key half of a setting's label, tagged with its scope when it is not the
+/// default one.
+fn label_key(setting: &DefaultSetting) -> String {
+    format!("{}{}", setting.key, setting.host.suffix())
+}
+
+fn label(setting: &DefaultSetting) -> String {
+    format!("{} {}", setting.domain, label_key(setting))
 }
 
 /// Select the macos files to act on (all, or filtered by `only` file names).
@@ -132,17 +204,40 @@ fn selected_files<'a>(cfg: &'a Config, only: Option<&[String]>) -> Result<Vec<&'
     Ok(out)
 }
 
+/// Problems in the macOS files that can be found without touching the machine:
+/// a `value =` that does not match its declared `type =`.
+///
+/// Surfaced by `doctor` so a typo is caught before `apply` runs against the
+/// real system and leaves half a file applied.
+pub fn validate(cfg: &Config) -> Vec<String> {
+    let mut problems = Vec::new();
+    for file in &cfg.macos {
+        for setting in &file.defaults {
+            if let Err(e) = desired(setting) {
+                problems.push(format!("macos/{}.toml: {e:#}", file.name()));
+            }
+        }
+    }
+    problems
+}
+
 /// `macos diff`: read-only drift report.
 pub fn diff(cfg: &Config, only: Option<&[String]>) -> Result<Summary> {
     let mut summary = Summary::new();
+    let mut store = Store::new();
     for file in selected_files(cfg, only)? {
         ui::heading(format!("macOS · {}", file.name()));
         for setting in &file.defaults {
-            let label = format!("{} {}", setting.domain, setting.key);
-            let status = if is_in_sync(setting) {
-                Status::Unchanged
-            } else {
-                Status::Changed
+            let label = label(setting);
+            // A value that does not match its declared type is a config bug,
+            // not drift; report it as a failure rather than a pending change.
+            let status = match is_in_sync(setting, &mut store) {
+                Ok(true) => Status::Unchanged,
+                Ok(false) => Status::Changed,
+                Err(e) => {
+                    ui::err(format!("{label}: {e:#}"));
+                    Status::Failed
+                }
             };
             summary.record(status, &label);
         }
@@ -176,6 +271,7 @@ pub fn apply(
 ) -> Result<Summary> {
     let mut summary = Summary::new();
     let mut to_kill: BTreeSet<String> = BTreeSet::new();
+    let mut store = Store::new();
 
     for file in selected_files(cfg, only)? {
         ui::heading(format!("macOS · {}", file.name()));
@@ -184,18 +280,29 @@ pub fn apply(
         let changed_before = summary.changed;
 
         for setting in &file.defaults {
-            let label = format!("{} {}", setting.domain, setting.key);
-            if is_in_sync(setting) {
-                summary.record(Status::Unchanged, &label);
-                continue;
+            let label = label(setting);
+            match is_in_sync(setting, &mut store) {
+                Ok(true) => {
+                    summary.record(Status::Unchanged, &label);
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    ui::err(format!("{label}: {e:#}"));
+                    summary.record(Status::Failed, &label);
+                    continue;
+                }
             }
             if dry {
                 summary.record(Status::Changed, &format!("{label} [dry-run]"));
                 continue;
             }
-            remember_previous(state, setting);
+            remember_previous(state, setting, &mut store);
             match write_default(setting) {
-                Ok(()) => summary.record(Status::Changed, &label),
+                Ok(()) => {
+                    store.invalidate(&setting.domain, setting.host);
+                    summary.record(Status::Changed, &label)
+                }
                 Err(e) => {
                     ui::err(format!("{label}: {e:#}"));
                     summary.record(Status::Failed, &label);
@@ -279,6 +386,10 @@ fn restart(apps: &BTreeSet<String>) {
 }
 
 /// The `defaults` flag that writes a value back as the type it originally had.
+///
+/// Only used for state written by older macboot versions, which archived the
+/// flattened `defaults read` text plus a `read-type` name. Records written now
+/// carry the full plist and restore through XML instead, so no type is lost.
 fn flag_for_type(plist_type: &str) -> Option<&'static str> {
     match plist_type {
         "boolean" => Some("-bool"),
@@ -286,8 +397,7 @@ fn flag_for_type(plist_type: &str) -> Option<&'static str> {
         "float" | "real" => Some("-float"),
         "string" => Some("-string"),
         "date" => Some("-date"),
-        // Arrays, dicts and data cannot be round-tripped through the one-line
-        // `defaults read` output we captured.
+        // A one-line capture of an array or dict cannot be written back.
         _ => None,
     }
 }
@@ -317,18 +427,17 @@ pub fn revert(cfg: &Config, state: &mut State, domain: Option<&str>, dry: bool) 
     ui::heading(format!("Reverting {} default(s)", targets.len()));
     let mut reverted_domains: BTreeSet<String> = BTreeSet::new();
     for record in targets {
-        let label = format!("{} {}", record.domain, record.key);
+        let label = format!("{} {}{}", record.domain, record.key, record.host.suffix());
         if dry {
-            let what = match &record.previous {
-                Some(v) => format!("restore to {v}"),
-                None => "delete".to_string(),
-            };
-            summary.record(Status::Changed, &format!("{label} ({what}) [dry-run]"));
+            summary.record(
+                Status::Changed,
+                &format!("{label} ({}) [dry-run]", describe_restore(&record)),
+            );
             continue;
         }
         match revert_one(&record) {
             Ok(true) => {
-                state.remove_default(&record.domain, &record.key);
+                state.remove_default(&record.domain, &record.key, record.host);
                 reverted_domains.insert(record.domain.clone());
                 summary.record(Status::Changed, &label);
             }
@@ -349,18 +458,35 @@ pub fn revert(cfg: &Config, state: &mut State, domain: Option<&str>, dry: bool) 
     Ok(summary)
 }
 
-/// Restore one key. Returns false when the original value's type is one we
-/// cannot write back.
+/// What `revert` would do to a key, for the dry-run line.
+fn describe_restore(record: &DefaultRecord) -> String {
+    if let Some(xml) = &record.previous_plist {
+        return match value::from_xml(xml) {
+            Ok(v) => format!("restore to {}", value::describe(&v)),
+            Err(_) => "restore".to_string(),
+        };
+    }
+    match &record.previous {
+        Some(v) => format!("restore to {v}"),
+        None => "delete".to_string(),
+    }
+}
+
+/// Restore one key to its pre-macboot value. Returns false when the record is
+/// an old-format one whose type cannot be written back.
 fn revert_one(record: &DefaultRecord) -> Result<bool> {
-    let run = |args: &[&str]| -> Result<()> {
-        if record.sudo {
-            let mut with_sudo = vec!["defaults"];
-            with_sudo.extend_from_slice(args);
-            proc::run("sudo", &with_sudo)
-        } else {
-            proc::run("defaults", args)
-        }
-    };
+    let run = |args: &[&str]| run_defaults(record.sudo, record.host, args);
+
+    // Current records archive the full plist, so any type restores exactly.
+    if let Some(xml) = &record.previous_plist {
+        // Re-parsing proves the archive is intact before we overwrite the
+        // live value with it.
+        let restored = value::from_xml(xml)
+            .with_context(|| format!("restoring {} {}", record.domain, record.key))?;
+        let payload = value::to_xml(&restored)?;
+        run(&["write", &record.domain, &record.key, &payload])?;
+        return Ok(true);
+    }
 
     let Some(previous) = &record.previous else {
         // The key did not exist before macboot; deleting restores that.
@@ -370,7 +496,8 @@ fn revert_one(record: &DefaultRecord) -> Result<bool> {
     let plist_type = record.previous_type.as_deref().unwrap_or("string");
     let Some(flag) = flag_for_type(plist_type) else {
         ui::warn(format!(
-            "{} {} was a {plist_type}; restore it by hand",
+            "{} {} was a {plist_type} recorded before macboot archived full \
+             values; restore it by hand",
             record.domain, record.key
         ));
         return Ok(false);
@@ -431,6 +558,20 @@ mod tests {
             kind,
             value,
             sudo: false,
+            host: HostScope::Any,
+        }
+    }
+
+    fn record(previous: Option<&str>, host: HostScope, recorded: &str) -> DefaultRecord {
+        DefaultRecord {
+            domain: "com.example".into(),
+            key: "k".into(),
+            previous_plist: previous.map(String::from),
+            previous: None,
+            previous_type: None,
+            sudo: false,
+            host,
+            recorded: recorded.into(),
         }
     }
 
@@ -487,11 +628,12 @@ mod tests {
     }
 
     #[test]
-    fn restorable_types_map_to_write_flags() {
+    fn legacy_records_map_their_type_to_a_write_flag() {
         assert_eq!(flag_for_type("boolean"), Some("-bool"));
         assert_eq!(flag_for_type("integer"), Some("-int"));
         assert_eq!(flag_for_type("string"), Some("-string"));
-        // Shapes we captured as a one-line string cannot be written back.
+        // Shapes an old macboot captured as a one-line string can't be written
+        // back; records written now carry XML and avoid this path entirely.
         assert_eq!(flag_for_type("dictionary"), None);
         assert_eq!(flag_for_type("array"), None);
     }
@@ -499,28 +641,128 @@ mod tests {
     #[test]
     fn first_write_wins_so_revert_reaches_the_original() {
         let mut state = State::default();
-        let setting = setting(DefaultType::Int, toml::Value::Integer(36));
-        state.insert_default(DefaultRecord {
-            domain: setting.domain.clone(),
-            key: setting.key.clone(),
-            previous: Some("48".into()),
-            previous_type: Some("integer".into()),
-            sudo: false,
-            recorded: "1".into(),
-        });
+        state.insert_default(record(Some("<48/>"), HostScope::Any, "1"));
         // A later apply must not overwrite the pre-macboot value with macboot's.
-        state.insert_default(DefaultRecord {
-            domain: setting.domain.clone(),
-            key: setting.key.clone(),
-            previous: Some("36".into()),
-            previous_type: Some("integer".into()),
-            sudo: false,
-            recorded: "2".into(),
-        });
+        state.insert_default(record(Some("<36/>"), HostScope::Any, "2"));
         assert_eq!(
-            state.defaults["com.example k"].previous.as_deref(),
-            Some("48")
+            state.defaults["com.example k"].previous_plist.as_deref(),
+            Some("<48/>")
         );
+    }
+
+    /// A domain+key pair holds independent values in the two preference stores,
+    /// so recording one must not make macboot think it knows the other.
+    #[test]
+    fn the_two_host_scopes_are_tracked_separately() {
+        let mut state = State::default();
+        state.insert_default(record(Some("<1/>"), HostScope::Any, "1"));
+        assert!(state.knows_default("com.example", "k", HostScope::Any));
+        assert!(!state.knows_default("com.example", "k", HostScope::Current));
+
+        state.insert_default(record(Some("<2/>"), HostScope::Current, "2"));
+        assert_eq!(state.defaults.len(), 2);
+        assert!(state
+            .remove_default("com.example", "k", HostScope::Current)
+            .is_some());
+        assert!(state.knows_default("com.example", "k", HostScope::Any));
+    }
+
+    /// Complex values are exactly what the old text-capture revert lost, so the
+    /// archive has to survive a save/load cycle intact.
+    #[test]
+    fn an_archived_dict_survives_the_state_round_trip() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("Battery".into(), plist::Value::Integer(18.into()));
+        let original = plist::Value::Dictionary(dict);
+
+        let xml = value::to_xml(&original).unwrap();
+        let mut state = State::default();
+        state.insert_default(record(Some(&xml), HostScope::Any, "1"));
+
+        let json = serde_json::to_string(&state).unwrap();
+        let reloaded: State = serde_json::from_str(&json).unwrap();
+        let stored = reloaded.defaults["com.example k"]
+            .previous_plist
+            .as_deref()
+            .unwrap();
+        assert!(value::equal(&original, &value::from_xml(stored).unwrap()));
+    }
+
+    /// State files written before ByHost and XML archiving must still revert.
+    #[test]
+    fn legacy_state_json_still_loads_and_reverts() {
+        let json = r#"{
+            "links": {},
+            "defaults": {
+                "com.apple.dock tilesize": {
+                    "domain": "com.apple.dock",
+                    "key": "tilesize",
+                    "previous": "48",
+                    "previous_type": "integer",
+                    "sudo": false,
+                    "recorded": "old"
+                }
+            }
+        }"#;
+        let state: State = serde_json::from_str(json).unwrap();
+        let record = &state.defaults["com.apple.dock tilesize"];
+        assert_eq!(record.host, HostScope::Any);
+        assert!(record.previous_plist.is_none());
+        assert_eq!(describe_restore(record), "restore to 48");
+    }
+
+    #[test]
+    fn a_key_that_did_not_exist_reverts_by_deletion() {
+        assert_eq!(
+            describe_restore(&record(None, HostScope::Any, "1")),
+            "delete"
+        );
+    }
+
+    #[test]
+    fn host_scope_selects_the_currenthost_flag() {
+        assert!(HostScope::Any.args().is_empty());
+        assert_eq!(HostScope::Current.args(), &["-currentHost"]);
+    }
+
+    #[test]
+    fn complex_types_have_no_write_flag_and_go_through_xml() {
+        let (flag, _) = write_value(&setting(
+            DefaultType::Array,
+            toml::Value::Array(vec![toml::Value::Integer(1)]),
+        ));
+        assert!(flag.is_empty());
+    }
+
+    #[test]
+    fn validate_reports_a_value_that_contradicts_its_type() {
+        let mut cfg = cfg_with_files(&["dock"]);
+        cfg.macos[0].defaults = vec![DefaultSetting {
+            domain: "com.apple.dock".into(),
+            key: "tilesize".into(),
+            kind: DefaultType::Int,
+            value: toml::Value::String("big".into()),
+            sudo: false,
+            host: HostScope::Any,
+        }];
+        let problems = validate(&cfg);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("macos/dock.toml"), "{problems:?}");
+        assert!(problems[0].contains("tilesize"), "{problems:?}");
+    }
+
+    #[test]
+    fn validate_passes_a_well_formed_complex_value() {
+        let mut cfg = cfg_with_files(&["dock"]);
+        cfg.macos[0].defaults = vec![DefaultSetting {
+            domain: "com.apple.dock".into(),
+            key: "persistent-apps".into(),
+            kind: DefaultType::Array,
+            value: toml::Value::Array(vec![toml::Value::String("Safari".into())]),
+            sudo: false,
+            host: HostScope::Any,
+        }];
+        assert!(validate(&cfg).is_empty());
     }
 
     #[test]

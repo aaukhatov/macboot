@@ -7,18 +7,23 @@
 //!
 //! The same idea as [`super::keyboard::dump`], generalized past symbolichotkeys.
 
+use super::value;
+use crate::config::HostScope;
 use crate::proc;
 use crate::ui;
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 
-/// Every key of every domain at one point in time.
-type Snapshot = BTreeMap<String, BTreeMap<String, plist::Value>>;
+/// Every key of every domain, in both preference stores, at one point in time.
+/// Keyed by domain *and* scope, since the same domain holds different keys in
+/// each.
+type Snapshot = BTreeMap<(String, HostScope), BTreeMap<String, plist::Value>>;
 
 /// One key that appeared or changed between the two snapshots.
 pub struct Change {
     pub domain: String,
     pub key: String,
+    pub host: HostScope,
     pub value: plist::Value,
     /// The value before the user's edit, if the key already existed.
     pub previous: Option<plist::Value>,
@@ -82,23 +87,17 @@ pub fn list_domains() -> Result<Vec<String>> {
     Ok(domains)
 }
 
-/// Read one domain into a key → value map. A domain that cannot be exported
-/// (sandboxed, malformed, removed mid-run) is simply absent from the snapshot.
-fn export_domain(domain: &str) -> Option<BTreeMap<String, plist::Value>> {
-    let out = proc::capture("defaults", &["export", domain, "-"]).ok()?;
-    if !out.success() {
-        return None;
-    }
-    let value = plist::Value::from_reader_xml(std::io::Cursor::new(out.stdout.as_bytes())).ok()?;
-    let dict = value.into_dictionary()?;
-    Some(dict.into_iter().collect())
-}
-
-/// Snapshot all `domains`. Exporting 700+ domains serially takes ~14s, so the
-/// work is split across a few scoped threads; each one only touches its own
-/// chunk and the results are merged on the main thread.
+/// Snapshot all `domains` in both preference stores. Exporting 700+ domains
+/// serially takes ~14s, so the work is split across a few scoped threads; each
+/// one only touches its own chunk and the results are merged on the main
+/// thread.
+///
+/// Both scopes are captured because a setting the user changes in System
+/// Settings may land in either one, and the point of `dump` is that they should
+/// not have to know which.
 fn snapshot(domains: &[String]) -> Snapshot {
     const THREADS: usize = 8;
+    const SCOPES: [HostScope; 2] = [HostScope::Any, HostScope::Current];
     let chunk = domains.len().div_ceil(THREADS).max(1);
     let mut merged = Snapshot::new();
     std::thread::scope(|scope| {
@@ -108,8 +107,10 @@ fn snapshot(domains: &[String]) -> Snapshot {
                 scope.spawn(move || {
                     let mut local = Snapshot::new();
                     for domain in group {
-                        if let Some(keys) = export_domain(domain) {
-                            local.insert(domain.clone(), keys);
+                        for host in SCOPES {
+                            if let Some(keys) = super::export_domain(domain, host) {
+                                local.insert((domain.clone(), host), keys);
+                            }
                         }
                     }
                     local
@@ -137,8 +138,8 @@ fn is_noisy(domain: &str, key: &str) -> bool {
 /// `[[defaults]]` can only express a value, not its absence.
 fn changes(before: &Snapshot, after: &Snapshot, all: bool) -> Vec<Change> {
     let mut out = Vec::new();
-    for (domain, keys) in after {
-        let old = before.get(domain);
+    for ((domain, host), keys) in after {
+        let old = before.get(&(domain.clone(), *host));
         for (key, value) in keys {
             if !all && is_noisy(domain, key) {
                 continue;
@@ -150,6 +151,7 @@ fn changes(before: &Snapshot, after: &Snapshot, all: bool) -> Vec<Change> {
             out.push(Change {
                 domain: domain.clone(),
                 key: key.clone(),
+                host: *host,
                 value: value.clone(),
                 previous: previous.cloned(),
             });
@@ -158,30 +160,12 @@ fn changes(before: &Snapshot, after: &Snapshot, all: bool) -> Vec<Change> {
     out
 }
 
-/// The `type =` / `value =` pair for a plist value, or None when the shape is
-/// one `[[defaults]]` cannot express yet (arrays, dicts, data, dates).
-fn toml_value(value: &plist::Value) -> Option<(&'static str, String)> {
-    match value {
-        plist::Value::Boolean(b) => Some(("bool", b.to_string())),
-        plist::Value::Integer(i) => Some(("int", i.to_string())),
-        plist::Value::Real(f) => Some(("float", f.to_string())),
-        plist::Value::String(s) => Some(("string", format!("{s:?}"))),
-        _ => None,
-    }
-}
-
-/// A short, readable rendering of the previous value for the `# was:` comment.
-fn describe(value: &plist::Value) -> String {
-    match toml_value(value) {
-        Some((_, rendered)) => rendered,
-        None => match value {
-            plist::Value::Array(a) => format!("<array of {}>", a.len()),
-            plist::Value::Dictionary(d) => format!("<dict of {}>", d.len()),
-            plist::Value::Data(_) => "<data>".to_string(),
-            plist::Value::Date(_) => "<date>".to_string(),
-            _ => "<unsupported>".to_string(),
-        },
-    }
+/// The `type =` / `value =` pair for a plist value, or None for a shape with no
+/// `[[defaults]]` representation.
+fn toml_value(v: &plist::Value) -> Option<(&'static str, String)> {
+    // `value = ` is 8 characters, which is where a multi-line array continues.
+    let rendered = value::render(v, 8)?;
+    Some((value::type_name(value::kind_of(v)?), rendered))
 }
 
 /// Render captured changes as the body of a `macos/*.toml` file.
@@ -208,25 +192,28 @@ pub fn to_toml(changes: &[Change]) -> String {
 
     for change in changes {
         match toml_value(&change.value) {
-            Some((kind, value)) => {
+            Some((kind, rendered)) => {
                 out.push_str("[[defaults]]\n");
                 out.push_str(&format!("domain = {:?}\n", change.domain));
                 out.push_str(&format!("key = {:?}\n", change.key));
                 out.push_str(&format!("type = {kind:?}\n"));
-                out.push_str(&format!("value = {value}\n"));
+                if change.host == HostScope::Current {
+                    out.push_str("host = \"current\"\n");
+                }
+                out.push_str(&format!("value = {rendered}\n"));
                 if let Some(previous) = &change.previous {
-                    out.push_str(&format!("# was: {}\n", describe(previous)));
+                    out.push_str(&format!("# was: {}\n", value::describe(previous)));
                 }
             }
             // Keep unsupported shapes visible rather than dropping them: the
             // user can still apply them via the [[command]] escape hatch.
             None => {
                 out.push_str(&format!(
-                    "# {} {} changed to {} — not expressible as [[defaults]] yet;\n\
+                    "# {} {} changed to {} — not expressible as [[defaults]];\n\
                      # use a [[command]] with `defaults write` if you need it.\n",
                     change.domain,
                     change.key,
-                    describe(&change.value)
+                    value::describe(&change.value)
                 ));
             }
         }
@@ -261,9 +248,13 @@ mod tests {
     use super::*;
 
     fn snap(pairs: &[(&str, &str, plist::Value)]) -> Snapshot {
+        scoped_snap(HostScope::Any, pairs)
+    }
+
+    fn scoped_snap(host: HostScope, pairs: &[(&str, &str, plist::Value)]) -> Snapshot {
         let mut out = Snapshot::new();
         for (domain, key, value) in pairs {
-            out.entry(domain.to_string())
+            out.entry((domain.to_string(), host))
                 .or_default()
                 .insert(key.to_string(), value.clone());
         }
@@ -332,20 +323,95 @@ mod tests {
         assert_eq!(parsed.killall, vec!["Dock".to_string()]);
     }
 
-    #[test]
-    fn unsupported_shapes_become_comments_not_bad_toml() {
+    /// Dumping the machine and applying the result must describe the same
+    /// settings, so whatever `to_toml` emits has to parse back into the very
+    /// values it was rendered from.
+    fn assert_dump_round_trips(host: HostScope, domain: &str, key: &str, live: plist::Value) {
         let got = changes(
             &Snapshot::new(),
-            &snap(&[(
-                "com.apple.dock",
-                "persistent-apps",
-                plist::Value::Array(vec![plist::Value::Boolean(true)]),
-            )]),
+            &scoped_snap(host, &[(domain, key, live.clone())]),
             false,
         );
         let rendered = to_toml(&got);
-        assert!(rendered.contains("not expressible"), "{rendered}");
-        let parsed: crate::config::MacosFile = toml::from_str(&rendered).unwrap();
-        assert!(parsed.defaults.is_empty());
+        let parsed: crate::config::MacosFile = toml::from_str(&rendered)
+            .unwrap_or_else(|e| panic!("dump did not parse back: {e}\n{rendered}"));
+        assert_eq!(parsed.defaults.len(), 1, "{rendered}");
+        let setting = &parsed.defaults[0];
+        assert_eq!(setting.key, key);
+        assert_eq!(setting.host, host, "{rendered}");
+        let reparsed = value::to_plist(setting.kind, &setting.value)
+            .unwrap_or_else(|e| panic!("re-parsing dumped value: {e:#}\n{rendered}"));
+        assert!(
+            value::equal(&live, &reparsed),
+            "dump lost the value: {live:?} -> {reparsed:?}\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_array_dumps_and_parses_back() {
+        assert_dump_round_trips(
+            HostScope::Any,
+            "com.apple.dock",
+            "persistent-others",
+            plist::Value::Array(vec![
+                plist::Value::String("a".into()),
+                plist::Value::Integer(2.into()),
+            ]),
+        );
+    }
+
+    /// Control Center's menu bar layout: a ByHost dict, which is both of the
+    /// shapes the old dump could not express.
+    #[test]
+    fn a_byhost_dict_dumps_with_its_scope_and_parses_back() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("Battery".into(), plist::Value::Integer(18.into()));
+        dict.insert("Bluetooth".into(), plist::Value::Integer(2.into()));
+        assert_dump_round_trips(
+            HostScope::Current,
+            "com.apple.controlcenter",
+            "MenuBar",
+            plist::Value::Dictionary(dict),
+        );
+    }
+
+    #[test]
+    fn a_nested_array_of_dicts_dumps_and_parses_back() {
+        let mut tile = plist::Dictionary::new();
+        tile.insert("file-label".into(), plist::Value::String("Safari".into()));
+        tile.insert("tile-type".into(), plist::Value::String("file-tile".into()));
+        assert_dump_round_trips(
+            HostScope::Any,
+            "com.apple.dock",
+            "persistent-apps",
+            plist::Value::Array(vec![plist::Value::Dictionary(tile)]),
+        );
+    }
+
+    #[test]
+    fn the_default_scope_is_not_annotated() {
+        let got = changes(
+            &Snapshot::new(),
+            &snap(&[("com.apple.dock", "autohide", plist::Value::Boolean(true))]),
+            false,
+        );
+        assert!(!to_toml(&got).contains("host ="));
+    }
+
+    /// The same key in both stores is two settings, not one.
+    #[test]
+    fn both_scopes_are_reported_independently() {
+        let mut after = scoped_snap(
+            HostScope::Any,
+            &[("com.apple.x", "k", plist::Value::Integer(1.into()))],
+        );
+        after.extend(scoped_snap(
+            HostScope::Current,
+            &[("com.apple.x", "k", plist::Value::Integer(2.into()))],
+        ));
+        let got = changes(&Snapshot::new(), &after, false);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().any(|c| c.host == HostScope::Current));
+        assert!(got.iter().any(|c| c.host == HostScope::Any));
     }
 }

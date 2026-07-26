@@ -1,0 +1,17 @@
+# Control Center and the menu bar.
+#
+# These live in the ByHost store (`defaults -currentHost`), which is per-machine
+# rather than per-user, so every entry needs `host = "current"`. Without it the
+# key reads as missing and macboot would rewrite it on every apply.
+#
+# Discover the current values with:
+#   macboot macos dump --domain com.apple.controlcenter
+killall = ["ControlCenter"]
+
+# 2 = hidden, 18 = shown in the menu bar, 24 = shown in Control Center only.
+[[defaults]]
+domain = "com.apple.controlcenter"
+key = "MenuBar"
+type = "dict"
+host = "current"
+value = { "Battery" = 18, "BatteryShowPercentage" = 1, "Bluetooth" = 18, "Display" = 2 }

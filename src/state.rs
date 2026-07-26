@@ -3,6 +3,7 @@
 //! `~/.local/state/macboot/state.json`) so that `unlink` only ever touches links
 //! we created, and clobbered files can be restored.
 
+use crate::config::HostScope;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -32,19 +33,33 @@ pub struct LinkRecord {
 pub struct DefaultRecord {
     pub domain: String,
     pub key: String,
-    /// Raw `defaults read` output from before macboot first wrote this key.
-    /// `None` means the key did not exist and revert should delete it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The key's full pre-macboot value as an XML plist document, or `None` if
+    /// the key did not exist (in which case revert deletes it).
+    ///
+    /// An XML archive rather than text because arrays and dicts have no
+    /// faithful one-line form: capturing `defaults read` output would silently
+    /// make those keys unrevertable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_plist: Option<String>,
+    /// Legacy: flattened `defaults read` output, written by macboot versions
+    /// before `previous_plist`. Read for revert, never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<String>,
-    /// `defaults read-type` result for that value (e.g. "boolean"), so revert
-    /// can write it back with the right flag.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Legacy companion to `previous`: the `defaults read-type` name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_type: Option<String>,
     /// Whether writing this domain needed sudo.
     #[serde(default)]
     pub sudo: bool,
+    /// Which preference store the key lives in.
+    #[serde(default, skip_serializing_if = "is_default_scope")]
+    pub host: HostScope,
     /// ISO-ish timestamp of the first time macboot wrote this key.
     pub recorded: String,
+}
+
+fn is_default_scope(host: &HostScope) -> bool {
+    *host == HostScope::Any
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -120,22 +135,32 @@ impl State {
     }
 
     /// Have we already recorded the pre-macboot value of this key?
-    pub fn knows_default(&self, domain: &str, key: &str) -> bool {
-        self.defaults.contains_key(&default_key(domain, key))
+    pub fn knows_default(&self, domain: &str, key: &str, host: HostScope) -> bool {
+        self.defaults.contains_key(&default_key(domain, key, host))
     }
 
     /// Record a key's original value. Only the *first* write is kept, so revert
     /// always returns to the state the machine was in before macboot touched it.
     pub fn insert_default(&mut self, record: DefaultRecord) {
-        let slot = default_key(&record.domain, &record.key);
+        let slot = default_key(&record.domain, &record.key, record.host);
         self.defaults.entry(slot).or_insert(record);
     }
 
-    pub fn remove_default(&mut self, domain: &str, key: &str) -> Option<DefaultRecord> {
-        self.defaults.remove(&default_key(domain, key))
+    pub fn remove_default(
+        &mut self,
+        domain: &str,
+        key: &str,
+        host: HostScope,
+    ) -> Option<DefaultRecord> {
+        self.defaults.remove(&default_key(domain, key, host))
     }
 }
 
-fn default_key(domain: &str, key: &str) -> String {
-    format!("{domain} {key}")
+/// The state map key for one setting.
+///
+/// The same domain and key can hold different values in the two preference
+/// stores, so the scope is part of the identity — but the default scope keeps
+/// its bare form so state files written before ByHost support still match.
+fn default_key(domain: &str, key: &str, host: HostScope) -> String {
+    format!("{domain} {key}{}", host.suffix())
 }

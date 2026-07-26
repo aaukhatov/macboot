@@ -17,3 +17,14 @@ domain = "com.apple.dock"
 key = "show-recents"
 type = "bool"
 value = false
+
+# Arrays and dicts are expressed inline; element types follow the TOML shape.
+# This pins the Dock's contents, which is a plain array of dictionaries.
+[[defaults]]
+domain = "com.apple.dock"
+key = "persistent-apps"
+type = "array"
+value = [
+  { "tile-type" = "file-tile", "tile-data" = { "file-label" = "Safari", "bundle-identifier" = "com.apple.Safari" } },
+  { "tile-type" = "spacer-tile" },
+]
