@@ -122,6 +122,17 @@ macboot macos dump --dry-run                # print to stdout, write nothing
 `dump` never overwrites an existing `macos/*.toml`; pick another `--output` name, or use
 `--dry-run` and merge by hand.
 
+The default mode is a *diff*: it only sees settings you change between the two snapshots, so
+it can't capture a machine that's already configured the way you want it. For that, use
+`--snapshot` to capture every current value in one pass, with no before/after and no pause:
+
+```sh
+macboot macos dump --domain com.apple.dock --snapshot --output dock
+```
+
+`--snapshot` still goes through the same noise filter as a diff, so pass `--all` if you want
+churn keys included too.
+
 Keys that churn on their own (window frames, recent-item lists, session IDs) are filtered;
 pass `--all` to keep them. Values macboot can't yet express as `[[defaults]]` — arrays and
 dicts — are emitted as comments rather than silently dropped.
