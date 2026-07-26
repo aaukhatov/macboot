@@ -48,6 +48,7 @@ enum Command {
         /// Restrict to these stages (comma-separated: packages,dotfiles,macos).
         #[arg(long)]
         only: Option<String>,
+        /// Preview changes without applying them.
         #[arg(long)]
         dry_run: bool,
         /// Skip providers whose CLI is missing instead of failing.
@@ -58,33 +59,43 @@ enum Command {
     Status,
     /// Detailed intended-vs-current diff (optionally filtered).
     Diff {
+        /// Restrict to these stages (comma-separated: packages,dotfiles,macos).
         #[arg(long)]
         only: Option<String>,
     },
 
     /// Create dotfile symlinks (stow replacement).
     Link {
+        /// Only these packages (default: every package under dotfiles/).
         packages: Vec<String>,
+        /// Preview changes without creating any links.
         #[arg(long)]
         dry_run: bool,
     },
     /// Remove macboot-owned dotfile links; restore backups.
     Unlink {
+        /// Only these packages (default: every package under dotfiles/).
         packages: Vec<String>,
+        /// Preview changes without removing any links.
         #[arg(long)]
         dry_run: bool,
     },
     /// Unlink then link (after moving files within a package).
     Relink {
+        /// Only these packages (default: every package under dotfiles/).
         packages: Vec<String>,
+        /// Preview changes without touching any links.
         #[arg(long)]
         dry_run: bool,
     },
     /// Move an existing ~/file into a package and link it back.
     Adopt {
+        /// Package to move the file(s) into.
         #[arg(long)]
         package: String,
+        /// Files under $HOME to adopt.
         files: Vec<PathBuf>,
+        /// Preview changes without moving or linking any files.
         #[arg(long)]
         dry_run: bool,
     },
@@ -123,10 +134,7 @@ enum Command {
     Profile,
     /// Full self-check (alias: verify); non-zero exit on failure.
     #[command(alias = "verify")]
-    Doctor {
-        #[arg(long)]
-        fix: bool,
-    },
+    Doctor,
     /// Snapshot the current machine into manifest form (stdout).
     Capture,
     /// Generate shell completions.
@@ -137,28 +145,35 @@ enum Command {
 enum PkgCmd {
     /// Install declared packages (idempotent).
     Apply {
+        /// Only this provider (default: every declared provider).
         #[arg(long)]
         provider: Option<String>,
+        /// Preview changes without installing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Skip providers whose CLI is missing instead of failing.
         #[arg(long)]
         skip_missing: bool,
     },
     /// Show per-provider drift; non-zero exit if any drift.
     Diff {
+        /// Only this provider (default: every declared provider).
         #[arg(long)]
         provider: Option<String>,
     },
     /// Remove extraneous packages (confirmation-gated).
     Clean {
+        /// Only this provider (default: every declared provider).
         #[arg(long)]
         provider: Option<String>,
+        /// Preview changes without removing anything.
         #[arg(long)]
         dry_run: bool,
     },
     /// Snapshot installed packages into packages/<provider>/ in each manager's
     /// own format (Brewfile, package.json, ...).
     Dump {
+        /// Only this provider (default: every declared provider).
         #[arg(long)]
         provider: Option<String>,
         /// Print to stdout instead of writing the files.
@@ -171,13 +186,18 @@ enum PkgCmd {
 
 #[derive(Subcommand)]
 enum MacosCmd {
+    /// Apply declared defaults, commands, and hotkeys for the active profile.
     Apply {
+        /// Restrict to these macos/*.toml files by name (comma-separated).
         #[arg(long)]
         only: Option<String>,
+        /// Preview changes without writing any defaults.
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show drift between declared and current defaults.
     Diff {
+        /// Restrict to these macos/*.toml files by name (comma-separated).
         #[arg(long)]
         only: Option<String>,
     },
@@ -209,6 +229,7 @@ enum MacosCmd {
         /// Only revert this domain.
         #[arg(long, value_name = "DOMAIN")]
         domain: Option<String>,
+        /// Preview changes without restoring anything.
         #[arg(long)]
         dry_run: bool,
     },
@@ -224,6 +245,7 @@ enum KeyboardCmd {
     },
     /// Apply keybindings and reload settings.
     Apply {
+        /// Preview changes without applying them.
         #[arg(long)]
         dry_run: bool,
     },
@@ -300,7 +322,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         },
 
         Command::Profile => commands::profile_show(&ctx),
-        Command::Doctor { fix } => commands::doctor(&ctx, fix),
+        Command::Doctor => commands::doctor(&ctx),
         Command::Capture => commands::capture(&ctx),
         Command::Init { .. } | Command::Completions { .. } => unreachable!("handled above"),
     }

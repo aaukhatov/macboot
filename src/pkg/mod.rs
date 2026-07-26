@@ -133,13 +133,13 @@ pub fn registry(packages: &Packages) -> Vec<Box<dyn Provider>> {
 /// Filter a registry by a comma-separated `--provider` selector (None ⇒ all).
 pub fn select<'a>(
     providers: &'a [Box<dyn Provider>],
-    only: Option<&str>,
+    provider: Option<&str>,
 ) -> Result<Vec<&'a dyn Provider>> {
     let all: Vec<&dyn Provider> = providers.iter().map(|b| b.as_ref()).collect();
-    let Some(only) = only else {
+    let Some(provider) = provider else {
         return Ok(all);
     };
-    let wanted: Vec<&str> = only.split(',').map(|s| s.trim()).collect();
+    let wanted: Vec<&str> = provider.split(',').map(|s| s.trim()).collect();
     let mut out = Vec::new();
     for name in &wanted {
         match all.iter().find(|p| p.name() == *name) {

@@ -171,20 +171,20 @@ pub fn adopt(ctx: &Ctx, package: &str, files: &[PathBuf], dry: bool) -> Result<(
 
 // ---- packages --------------------------------------------------------------
 
-pub fn pkg_apply(ctx: &Ctx, only: Option<&str>, dry: bool, skip_missing: bool) -> Result<()> {
+pub fn pkg_apply(ctx: &Ctx, provider: Option<&str>, dry: bool, skip_missing: bool) -> Result<()> {
     let cfg = ctx.load()?;
     let providers = pkg::registry(&cfg.packages);
     pkg::preflight(&providers, skip_missing)?;
-    let selected = pkg::select(&providers, only)?;
+    let selected = pkg::select(&providers, provider)?;
     let summary = pkg::apply(&selected, dry)?;
     summary.render();
     Ok(())
 }
 
-pub fn pkg_diff(ctx: &Ctx, only: Option<&str>) -> Result<()> {
+pub fn pkg_diff(ctx: &Ctx, provider: Option<&str>) -> Result<()> {
     let cfg = ctx.load()?;
     let providers = pkg::registry(&cfg.packages);
-    let selected = pkg::select(&providers, only)?;
+    let selected = pkg::select(&providers, provider)?;
     let any = pkg::report_diff(&selected)?;
     if any {
         // Non-zero exit lets CI/pre-commit gate drift.
@@ -193,10 +193,10 @@ pub fn pkg_diff(ctx: &Ctx, only: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub fn pkg_clean(ctx: &Ctx, only: Option<&str>, dry: bool) -> Result<()> {
+pub fn pkg_clean(ctx: &Ctx, provider: Option<&str>, dry: bool) -> Result<()> {
     let cfg = ctx.load()?;
     let providers = pkg::registry(&cfg.packages);
-    let selected = pkg::select(&providers, only)?;
+    let selected = pkg::select(&providers, provider)?;
     if !dry && !ui::ask("Remove extraneous packages?", ctx.assume_yes) {
         ui::warn("Aborted.");
         return Ok(());
@@ -206,10 +206,10 @@ pub fn pkg_clean(ctx: &Ctx, only: Option<&str>, dry: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn pkg_dump(ctx: &Ctx, only: Option<&str>, dry: bool) -> Result<()> {
+pub fn pkg_dump(ctx: &Ctx, provider: Option<&str>, dry: bool) -> Result<()> {
     let cfg = ctx.load()?;
     let providers = pkg::registry(&cfg.packages);
-    let selected = pkg::select(&providers, only)?;
+    let selected = pkg::select(&providers, provider)?;
     let summary = pkg::dump(&selected, &cfg.root, dry)?;
     summary.render();
     Ok(())
@@ -370,7 +370,7 @@ pub fn profile_show(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-pub fn doctor(ctx: &Ctx, _fix: bool) -> Result<()> {
+pub fn doctor(ctx: &Ctx) -> Result<()> {
     let mut summary = Summary::new();
     ui::heading("Self");
 

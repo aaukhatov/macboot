@@ -56,21 +56,24 @@ macboot apply --dry-run      # then: macboot apply
 macboot init [dir] [--force]                            # scaffold a default config
 macboot apply [--only …] [--dry-run] [--skip-missing]   # reconcile everything
 macboot status                                          # drift summary (read-only)
-macboot diff  [--only dotfiles,packages,macos]          # detailed drift
+macboot diff  [--only packages,dotfiles,macos]          # detailed drift
 
 macboot link|unlink|relink [pkg…] [--dry-run]           # stow replacement
-macboot adopt --package <pkg> <file>…                   # pull ~/file into a package
+macboot adopt --package <pkg> <file>… [--dry-run]       # pull ~/file into a package
 
-macboot pkg apply|diff|clean [--provider …]             # multi-manager packages
-macboot pkg dump [--provider …] [--dry-run]             # installed → packages/<mgr>/
-macboot pkg list                                        # providers + availability
-macboot brew …                                          # alias for pkg --provider brew
+macboot pkg apply [--provider …] [--dry-run] [--skip-missing]  # install declared packages
+macboot pkg diff  [--provider …]                               # per-provider drift
+macboot pkg clean [--provider …] [--dry-run]                   # remove extraneous packages
+macboot pkg dump  [--provider …] [--dry-run]                   # installed → packages/<mgr>/
+macboot pkg list                                               # providers + availability
+macboot brew …                                                 # alias for pkg --provider brew
 
-macboot macos apply|diff [--only dock,finder,…]         # declarative defaults
+macboot macos apply [--only dock,finder,…] [--dry-run]  # apply declarative defaults
+macboot macos diff  [--only dock,finder,…]              # drift vs. current defaults
 macboot macos dump [--domain …] [--output NAME] [--dry-run]  # System Settings → TOML
 macboot macos revert [--domain …] [--dry-run]           # undo defaults macboot wrote
 macboot keyboard dump [--dry-run]                       # reverse symbolichotkeys → TOML
-macboot keyboard apply                                  # import keybindings + reload
+macboot keyboard apply [--dry-run]                      # import keybindings + reload
 
 macboot profile                                         # active profile + why
 macboot doctor            (alias: verify)               # full self-check, non-zero on fail
