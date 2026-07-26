@@ -435,6 +435,25 @@ pub fn doctor(ctx: &Ctx, _fix: bool) -> Result<()> {
         "Xcode Command Line Tools",
     );
 
+    // Advisory only — this terminal is fine without it, but `macos dump`/`apply`
+    // can silently skip protected domains (Mail, Safari, Messages, TCC) if it's
+    // missing, so it's worth surfacing rather than failing later with no clue why.
+    let fda_ok = macos::has_full_disk_access();
+    summary.record(
+        if fda_ok {
+            Status::Unchanged
+        } else {
+            Status::Skipped
+        },
+        "Terminal has Full Disk Access",
+    );
+    if !fda_ok {
+        ui::detail(
+            "grant it in System Settings → Privacy & Security → Full Disk Access, or \
+             `macos dump`/`apply` may silently skip some protected domains",
+        );
+    }
+
     // Dotfiles link health (status prints its own "Dotfiles" heading).
     let state = ctx.state()?;
     summary.merge(dotfiles::status(&cfg, &state, &[])?);

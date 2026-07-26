@@ -152,6 +152,28 @@ how many `apply` runs happened in between.
 > progress and summary output goes to stderr, so `macboot macos dump --dry-run > macos/dock.toml`
 > produces a clean file.
 
+### What this can't capture
+
+`macos dump`/`apply` only reach settings backed by `defaults` (Preferences plist domains).
+Several things people expect a "clone my Mac" tool to carry over live outside that store
+entirely and are out of scope here:
+
+- **Privacy permissions** (Full Disk Access, Screen Recording, Camera/Mic, Automation) live
+  in the SIP-protected `TCC.db`, not `defaults`. `macboot doctor` checks whether *this
+  terminal* has Full Disk Access — without it, `dump`/`apply` can silently skip protected
+  domains like Mail, Safari, and Messages — but re-granting permissions to every app on a
+  new machine is still a manual step.
+- **Keychain items** (Wi-Fi passwords, saved credentials) aren't exported or imported.
+- **Login items and LaunchAgents/LaunchDaemons** ("open at login" apps, background helpers)
+  aren't captured.
+- **Network/Bluetooth/printer state** (Wi-Fi networks, VPN profiles, Bluetooth pairings) live
+  in separate stores that need root and different tooling.
+- **Apple ID / iCloud sign-in** is deliberately unautomatable by Apple; do it by hand
+  regardless of tooling.
+
+Plan on doing these by hand on a new machine; `macboot` covers the `defaults`-backed
+preferences, packages, and dotfiles around them.
+
 ## Keybindings
 
 macOS stores system hotkeys as an opaque integer-keyed plist. macboot keeps a friendly

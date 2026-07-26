@@ -59,6 +59,19 @@ pub fn export_domain(domain: &str, host: HostScope) -> Option<BTreeMap<String, p
     Some(dict.into_iter().collect())
 }
 
+/// Best-effort check for Full Disk Access. Opening `TCC.db` itself is gated
+/// behind it, so failing to open it is a reliable (if indirect) signal —
+/// without it, `macos dump`/`apply` can silently skip protected domains
+/// (Mail, Safari, Messages, TCC) the same way `export_domain` does. Returns
+/// `true` (don't false-alarm) if `$HOME` can't be resolved at all.
+pub fn has_full_disk_access() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return true;
+    };
+    let tcc_db = home.join("Library/Application Support/com.apple.TCC/TCC.db");
+    std::fs::File::open(&tcc_db).is_ok()
+}
+
 /// The plist value a setting wants the key to hold.
 fn desired(setting: &DefaultSetting) -> Result<plist::Value> {
     value::to_plist(setting.kind, &setting.value).with_context(|| {
