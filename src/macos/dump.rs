@@ -95,35 +95,70 @@ pub fn list_domains() -> Result<Vec<String>> {
 /// Both scopes are captured because a setting the user changes in System
 /// Settings may land in either one, and the point of `dump` is that they should
 /// not have to know which.
-fn snapshot(domains: &[String]) -> Snapshot {
+///
+/// Also returns the domains whose default (`Any`-scope) export failed. Those
+/// domains came from `defaults domains`, so macOS itself confirms they exist —
+/// a failed export there is almost always the terminal lacking Full Disk
+/// Access rather than the domain being genuinely empty. `Current` (ByHost)
+/// failures are not tracked: most domains simply have no ByHost data, so that
+/// would flag normal domains as unreadable.
+fn snapshot(domains: &[String]) -> (Snapshot, Vec<String>) {
     const THREADS: usize = 8;
     const SCOPES: [HostScope; 2] = [HostScope::Any, HostScope::Current];
     let chunk = domains.len().div_ceil(THREADS).max(1);
     let mut merged = Snapshot::new();
+    let mut failed = Vec::new();
     std::thread::scope(|scope| {
         let handles: Vec<_> = domains
             .chunks(chunk)
             .map(|group| {
                 scope.spawn(move || {
                     let mut local = Snapshot::new();
+                    let mut local_failed = Vec::new();
                     for domain in group {
                         for host in SCOPES {
-                            if let Some(keys) = super::export_domain(domain, host) {
-                                local.insert((domain.clone(), host), keys);
+                            match super::export_domain(domain, host) {
+                                Some(keys) => {
+                                    local.insert((domain.clone(), host), keys);
+                                }
+                                None if host == HostScope::Any => {
+                                    local_failed.push(domain.clone());
+                                }
+                                None => {}
                             }
                         }
                     }
-                    local
+                    (local, local_failed)
                 })
             })
             .collect();
         for handle in handles {
-            if let Ok(local) = handle.join() {
+            if let Ok((local, local_failed)) = handle.join() {
                 merged.extend(local);
+                failed.extend(local_failed);
             }
         }
     });
-    merged
+    failed.sort();
+    failed.dedup();
+    (merged, failed)
+}
+
+/// Warn about domains that came back unreadable from one or both snapshots.
+fn warn_unreadable(domains: &[String]) {
+    if domains.is_empty() {
+        return;
+    }
+    ui::warn(format!(
+        "{} domain(s) could not be read and were skipped: {}",
+        domains.len(),
+        domains.join(", ")
+    ));
+    ui::detail(
+        "This usually means the terminal running macboot lacks Full Disk Access \
+         (System Settings → Privacy & Security → Full Disk Access) — affected apps \
+         commonly include Mail, Safari, Messages, and TCC itself.",
+    );
 }
 
 fn is_noisy(domain: &str, key: &str) -> bool {
@@ -231,7 +266,7 @@ pub fn dump(domains: &[String], all: bool) -> Result<Vec<Change>> {
     };
 
     ui::info(format!("Snapshotting {} domain(s)…", targets.len()));
-    let before = snapshot(&targets);
+    let (before, before_failed) = snapshot(&targets);
     ui::detail(format!("captured {} domain(s)", before.len()));
 
     if !ui::pause("Change what you want in System Settings, then press Enter") {
@@ -239,8 +274,56 @@ pub fn dump(domains: &[String], all: bool) -> Result<Vec<Change>> {
     }
 
     ui::info("Re-snapshotting…");
-    let after = snapshot(&targets);
+    let (after, after_failed) = snapshot(&targets);
+
+    let mut unreadable = before_failed;
+    unreadable.extend(after_failed);
+    unreadable.sort();
+    unreadable.dedup();
+    warn_unreadable(&unreadable);
+
     Ok(changes(&before, &after, all))
+}
+
+/// Capture every currently-set key as a `Change` with no before/after diff and
+/// no pause for editing. Unlike `dump`, this needs nothing to change during the
+/// run, so it can capture a machine that is already configured the way you
+/// want it — `dump`'s diff only ever sees settings you touch *during* the
+/// session.
+pub fn snapshot_now(domains: &[String], all: bool) -> Result<Vec<Change>> {
+    let targets = if domains.is_empty() {
+        list_domains()?
+    } else {
+        domains.to_vec()
+    };
+
+    ui::info(format!("Snapshotting {} domain(s)…", targets.len()));
+    let (current, failed) = snapshot(&targets);
+    ui::detail(format!("captured {} domain(s)", current.len()));
+    warn_unreadable(&failed);
+
+    Ok(as_changes(&current, all))
+}
+
+/// Every key in `snap` as a `Change` with no `previous` value, filtered
+/// through the same noise heuristics as a real diff.
+fn as_changes(snap: &Snapshot, all: bool) -> Vec<Change> {
+    let mut out = Vec::new();
+    for ((domain, host), keys) in snap {
+        for (key, value) in keys {
+            if !all && is_noisy(domain, key) {
+                continue;
+            }
+            out.push(Change {
+                domain: domain.clone(),
+                key: key.clone(),
+                host: *host,
+                value: value.clone(),
+                previous: None,
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -306,6 +389,32 @@ mod tests {
         )]);
         assert!(changes(&Snapshot::new(), &after, false).is_empty());
         assert_eq!(changes(&Snapshot::new(), &after, true).len(), 1);
+    }
+
+    #[test]
+    fn as_changes_reports_every_key_with_no_previous() {
+        let current = snap(&[
+            ("com.apple.dock", "autohide", plist::Value::Boolean(true)),
+            (
+                "com.apple.dock",
+                "tilesize",
+                plist::Value::Integer(48.into()),
+            ),
+        ]);
+        let got = as_changes(&current, false);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|c| c.previous.is_none()));
+    }
+
+    #[test]
+    fn as_changes_filters_churn_unless_all() {
+        let current = snap(&[(
+            "com.apple.finder",
+            "NSWindow Frame NSNavPanel",
+            plist::Value::String("0 0 100 100".into()),
+        )]);
+        assert!(as_changes(&current, false).is_empty());
+        assert_eq!(as_changes(&current, true).len(), 1);
     }
 
     #[test]

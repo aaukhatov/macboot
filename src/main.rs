@@ -194,6 +194,12 @@ enum MacosCmd {
         /// Include keys macboot filters as churn (window frames, recents, ...).
         #[arg(long)]
         all: bool,
+        /// Capture the current value of every key in one pass instead of
+        /// diffing a before/after snapshot. Use this to capture a machine
+        /// that's already configured the way you want it — plain `dump` only
+        /// sees settings you change *during* the session.
+        #[arg(long)]
+        snapshot: bool,
         /// Print to stdout instead of writing the file.
         #[arg(long)]
         dry_run: bool,
@@ -281,8 +287,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 domain,
                 output,
                 all,
+                snapshot,
                 dry_run,
-            } => commands::macos_dump(&ctx, &domain, output.as_deref(), all, dry_run),
+            } => commands::macos_dump(&ctx, &domain, output.as_deref(), all, snapshot, dry_run),
             MacosCmd::Revert { domain, dry_run } => {
                 commands::macos_revert(&ctx, domain.as_deref(), dry_run)
             }

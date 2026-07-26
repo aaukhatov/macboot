@@ -303,16 +303,25 @@ pub fn macos_dump(
     domains: &[String],
     output: Option<&str>,
     all: bool,
+    snapshot: bool,
     dry: bool,
 ) -> Result<()> {
     let cfg = ctx.load()?;
-    let changes = macos::dump::dump(domains, all)?;
+    let changes = if snapshot {
+        macos::dump::snapshot_now(domains, all)?
+    } else {
+        macos::dump::dump(domains, all)?
+    };
     if changes.is_empty() {
-        ui::warn("No settings changed between the two snapshots.");
-        ui::detail("If you did change something, re-run with --all to include filtered keys.");
+        if snapshot {
+            ui::warn("No keys captured for the given domain(s).");
+        } else {
+            ui::warn("No settings changed between the two snapshots.");
+            ui::detail("If you did change something, re-run with --all to include filtered keys.");
+        }
         return Ok(());
     }
-    ui::ok(format!("Captured {} changed key(s)", changes.len()));
+    ui::ok(format!("Captured {} key(s)", changes.len()));
 
     let name = output.unwrap_or(DEFAULT_DUMP_NAME);
     let toml = macos::dump::to_toml(&changes);
