@@ -4,6 +4,7 @@
 
 pub mod dump;
 pub mod keyboard;
+pub mod managed;
 pub mod value;
 
 use crate::config::{Config, DefaultSetting, DefaultType, HostScope, MacosFile};
@@ -11,6 +12,7 @@ use crate::proc;
 use crate::state::{DefaultRecord, State};
 use crate::ui::{self, Status, Summary};
 use anyhow::{bail, Context, Result};
+use managed::Managed;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Live preference values, read through `defaults export` and cached per run.
@@ -83,13 +85,54 @@ fn desired(setting: &DefaultSetting) -> Result<plist::Value> {
     })
 }
 
-/// Does the live value already match the desired value?
-fn is_in_sync(setting: &DefaultSetting, store: &mut Store) -> Result<bool> {
+/// What `diff`/`apply` should do about one setting.
+#[derive(Debug, PartialEq)]
+enum Resolved {
+    /// The machine already holds the desired value.
+    Matches,
+    /// The machine holds something else, and a write would fix it.
+    Drifted,
+    /// A configuration profile forces a *different* value. Writing the key
+    /// would succeed and change nothing an app can see, so we don't.
+    Forced(plist::Value),
+}
+
+/// Compare the declared value against what the machine actually resolves to.
+///
+/// A managed (profile-forced) key is checked first: the profile wins over
+/// whatever the user domain holds, so the forced value — not the exported one —
+/// is what the machine effectively has. A forced key that already matches is
+/// simply in sync; one that doesn't is out of our hands rather than drift.
+fn evaluate(
+    setting: &DefaultSetting,
+    store: &mut Store,
+    managed: &mut Managed,
+) -> Result<Resolved> {
     let want = desired(setting)?;
+    if let Some(forced) = managed.forced(&setting.domain, &setting.key) {
+        return Ok(if value::equal(&want, &forced) {
+            Resolved::Matches
+        } else {
+            Resolved::Forced(forced)
+        });
+    }
     let Some(current) = store.read(&setting.domain, &setting.key, setting.host) else {
-        return Ok(false);
+        return Ok(Resolved::Drifted);
     };
-    Ok(value::equal(&want, &current))
+    Ok(if value::equal(&want, &current) {
+        Resolved::Matches
+    } else {
+        Resolved::Drifted
+    })
+}
+
+/// The summary line for a key we refuse to write because a profile owns it.
+fn forced_label(setting: &DefaultSetting, forced: &plist::Value) -> String {
+    format!(
+        "{} (forced to {} by configuration profile)",
+        label(setting),
+        value::describe(forced)
+    )
 }
 
 /// Run a `defaults` subcommand in the right scope, with sudo if required.
@@ -234,25 +277,190 @@ pub fn validate(cfg: &Config) -> Vec<String> {
     problems
 }
 
+/// Declared keys an MDM profile forces to a different value, as summary labels.
+///
+/// Surfaced by `doctor` because the symptom is otherwise baffling: `apply`
+/// reports success, `diff` still shows the key, and nothing on screen explains
+/// that the machine is never going to accept the value.
+pub fn forced_conflicts(cfg: &Config) -> Vec<String> {
+    let mut managed = Managed::new();
+    if !managed.is_active() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for file in &cfg.macos {
+        for setting in &file.defaults {
+            // A value that fails its own type check is `validate`'s problem.
+            let Ok(want) = desired(setting) else { continue };
+            if let Some(forced) = managed.forced(&setting.domain, &setting.key) {
+                if !value::equal(&want, &forced) {
+                    out.push(format!(
+                        "macos/{}.toml: {}",
+                        file.name(),
+                        forced_label(setting, &forced)
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `macos get`: the live value of a domain (or one key), rendered as TOML.
+///
+/// The read-only counterpart to `dump`: no noise filter, no diff, no file
+/// written — just what the machine holds right now, in both host scopes, with
+/// profile-forced keys called out. Returns the text for stdout.
+pub fn get(domain: &str, key: Option<&str>, keys_only: bool, managed_only: bool) -> Result<String> {
+    let mut managed = Managed::new();
+    let scopes = [HostScope::Any, HostScope::Current];
+
+    if let Some(key) = key {
+        // Single-key reads stay bare so they can be captured in a shell
+        // variable; the "this is forced" note goes to stderr as commentary.
+        if let Some(forced) = managed.forced(domain, key) {
+            ui::warn(format!(
+                "{domain} {key} is forced by a configuration profile"
+            ));
+            return Ok(format!("{}\n", literal(&forced)));
+        }
+        if managed_only {
+            bail!("{domain} {key} is not managed by a configuration profile");
+        }
+        for scope in scopes {
+            if let Some(value) =
+                export_domain(domain, scope).and_then(|keys| keys.get(key).cloned())
+            {
+                return Ok(format!("{}\n", literal(&value)));
+            }
+        }
+        bail!("no key '{key}' in domain '{domain}'");
+    }
+
+    // Export each scope once: a `defaults` process per scope, never per key.
+    let exported: Vec<(HostScope, BTreeMap<String, plist::Value>)> = if managed_only {
+        Vec::new()
+    } else {
+        scopes
+            .iter()
+            .filter_map(|s| export_domain(domain, *s).map(|keys| (*s, keys)))
+            .collect()
+    };
+    let forced = managed.keys(domain);
+
+    // `--keys` output is meant for `xargs`, so it carries no scope headings and
+    // no comments — just the union of the names, deduplicated across scopes.
+    if keys_only {
+        let names: BTreeSet<&String> = exported
+            .iter()
+            .flat_map(|(_, keys)| keys.keys())
+            .chain(forced.keys())
+            .collect();
+        if names.is_empty() {
+            bail!("{}", nothing_found(domain, managed_only));
+        }
+        return Ok(names.iter().fold(String::new(), |mut acc, k| {
+            acc.push_str(k);
+            acc.push('\n');
+            acc
+        }));
+    }
+
+    let mut out = String::new();
+    for (scope, keys) in &exported {
+        if keys.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("# {domain}{}\n", scope.suffix()));
+        for (k, v) in keys {
+            out.push_str(&format!("{} = {}", quote_key(k), literal(v)));
+            // The profile wins, so flag any key whose exported value is not the
+            // one an app would actually be handed.
+            if let Some(profile_value) = forced.get(k) {
+                if value::equal(profile_value, v) {
+                    out.push_str("  # forced by profile");
+                } else {
+                    out.push_str(&format!(
+                        "  # forced to {} by profile",
+                        value::describe(profile_value)
+                    ));
+                }
+            }
+            out.push('\n');
+        }
+    }
+
+    // A profile can force a key the user domain has never held, so list managed
+    // keys no scope reported; otherwise they would be invisible here.
+    let seen: BTreeSet<&String> = exported.iter().flat_map(|(_, keys)| keys.keys()).collect();
+    let unseen: Vec<(&String, &plist::Value)> =
+        forced.iter().filter(|(k, _)| !seen.contains(k)).collect();
+    if !unseen.is_empty() {
+        out.push_str(&format!("# {domain} (forced by configuration profile)\n"));
+        for (k, v) in unseen {
+            out.push_str(&format!("{} = {}\n", quote_key(k), literal(v)));
+        }
+    }
+
+    if out.is_empty() {
+        bail!("{}", nothing_found(domain, managed_only));
+    }
+    Ok(out)
+}
+
+/// Why `get` found nothing. `--managed` failing on an unmanaged Mac is the
+/// common case and deserves to say so, rather than implying the domain is
+/// unreadable.
+fn nothing_found(domain: &str, managed_only: bool) -> String {
+    if managed_only {
+        format!("no keys in '{domain}' are forced by a configuration profile")
+    } else {
+        format!("no preferences readable in domain '{domain}'")
+    }
+}
+
+/// A plist value as a TOML literal, falling back to a description for shapes
+/// TOML cannot express (rather than printing nothing).
+fn literal(value: &plist::Value) -> String {
+    value::render(value, 0).unwrap_or_else(|| value::describe(value))
+}
+
+/// Preference keys contain spaces and dots freely, so quote anything that is
+/// not a bare TOML key.
+fn quote_key(key: &str) -> String {
+    if !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        key.to_string()
+    } else {
+        format!("{key:?}")
+    }
+}
+
 /// `macos diff`: read-only drift report.
 pub fn diff(cfg: &Config, only: Option<&[String]>) -> Result<Summary> {
     let mut summary = Summary::new();
     let mut store = Store::new();
+    let mut managed = Managed::new();
     for file in selected_files(cfg, only)? {
         ui::heading(format!("macOS · {}", file.name()));
         for setting in &file.defaults {
             let label = label(setting);
             // A value that does not match its declared type is a config bug,
             // not drift; report it as a failure rather than a pending change.
-            let status = match is_in_sync(setting, &mut store) {
-                Ok(true) => Status::Unchanged,
-                Ok(false) => Status::Changed,
+            match evaluate(setting, &mut store, &mut managed) {
+                Ok(Resolved::Matches) => summary.record(Status::Unchanged, &label),
+                Ok(Resolved::Drifted) => summary.record(Status::Changed, &label),
+                Ok(Resolved::Forced(forced)) => {
+                    summary.record(Status::Skipped, &forced_label(setting, &forced))
+                }
                 Err(e) => {
                     ui::err(format!("{label}: {e:#}"));
-                    Status::Failed
+                    summary.record(Status::Failed, &label);
                 }
-            };
-            summary.record(status, &label);
+            }
         }
         // Commands and keybindings can't be cheaply diffed; report their presence.
         for cmd in &file.commands {
@@ -285,6 +493,7 @@ pub fn apply(
     let mut summary = Summary::new();
     let mut to_kill: BTreeSet<String> = BTreeSet::new();
     let mut store = Store::new();
+    let mut managed = Managed::new();
 
     for file in selected_files(cfg, only)? {
         ui::heading(format!("macOS · {}", file.name()));
@@ -294,12 +503,23 @@ pub fn apply(
 
         for setting in &file.defaults {
             let label = label(setting);
-            match is_in_sync(setting, &mut store) {
-                Ok(true) => {
+            match evaluate(setting, &mut store, &mut managed) {
+                Ok(Resolved::Matches) => {
                     summary.record(Status::Unchanged, &label);
                     continue;
                 }
-                Ok(false) => {}
+                Ok(Resolved::Drifted) => {}
+                // Never write a forced key: the write would report success, the
+                // effective value would not move, and state would gain a
+                // revert record for a change that never happened.
+                Ok(Resolved::Forced(forced)) => {
+                    summary.record(Status::Skipped, &forced_label(setting, &forced));
+                    ui::detail(
+                        "an MDM configuration profile owns this key; remove it from the \
+                         config or change it in the profile",
+                    );
+                    continue;
+                }
                 Err(e) => {
                     ui::err(format!("{label}: {e:#}"));
                     summary.record(Status::Failed, &label);
@@ -795,5 +1015,76 @@ mod tests {
         let (bin, rest) = command_argv(true, &["pmset".into(), "-a".into()]);
         assert_eq!(bin, "sudo");
         assert_eq!(rest, vec!["pmset".to_string(), "-a".to_string()]);
+    }
+
+    /// A `Managed` backed by a temp root holding one forced key on `com.example`,
+    /// the domain `setting()` uses.
+    fn managed_forcing(value: plist::Value) -> (tempfile::TempDir, Managed) {
+        let dir = tempfile::tempdir().unwrap();
+        let dict = plist::Dictionary::from_iter([("k".to_string(), value)]);
+        plist::to_file_xml(
+            dir.path().join("com.example.plist"),
+            &plist::Value::Dictionary(dict),
+        )
+        .unwrap();
+        let managed = Managed::with_root(dir.path().to_path_buf(), None);
+        (dir, managed)
+    }
+
+    /// The forced value already being right means the machine is in sync — and
+    /// crucially, the user domain is never even consulted.
+    #[test]
+    fn a_forced_key_that_matches_is_in_sync() {
+        let (_dir, mut managed) = managed_forcing(plist::Value::Integer(36.into()));
+        let s = setting(DefaultType::Int, toml::Value::Integer(36));
+        let sync = evaluate(&s, &mut Store::new(), &mut managed).unwrap();
+        assert_eq!(sync, Resolved::Matches);
+    }
+
+    /// The case that motivates all of this: without the managed check this key
+    /// would be reported as drift forever and rewritten on every apply.
+    #[test]
+    fn a_forced_key_that_differs_is_not_drift() {
+        let (_dir, mut managed) = managed_forcing(plist::Value::Integer(64.into()));
+        let s = setting(DefaultType::Int, toml::Value::Integer(36));
+        let sync = evaluate(&s, &mut Store::new(), &mut managed).unwrap();
+        assert_eq!(sync, Resolved::Forced(plist::Value::Integer(64.into())));
+    }
+
+    /// Forced values go through `value::equal`, not `==`, for the same reason
+    /// live ones do: a profile may store a boolean as 1.
+    #[test]
+    fn a_forced_bool_stored_as_an_int_still_matches() {
+        let (_dir, mut managed) = managed_forcing(plist::Value::Integer(1.into()));
+        let s = setting(DefaultType::Bool, toml::Value::Boolean(true));
+        assert_eq!(
+            evaluate(&s, &mut Store::new(), &mut managed).unwrap(),
+            Resolved::Matches
+        );
+    }
+
+    #[test]
+    fn forced_label_names_the_value_the_profile_imposes() {
+        let s = setting(DefaultType::Int, toml::Value::Integer(36));
+        let label = forced_label(&s, &plist::Value::Integer(64.into()));
+        assert!(label.contains("com.example k"), "{label}");
+        assert!(label.contains("64"), "{label}");
+        assert!(label.contains("configuration profile"), "{label}");
+    }
+
+    /// Preference keys are full of spaces and dots, and `macos get` output is
+    /// meant to be readable as TOML.
+    #[test]
+    fn get_output_quotes_keys_that_are_not_bare() {
+        assert_eq!(quote_key("tilesize"), "tilesize");
+        assert_eq!(quote_key("AppleShowAllFiles-2"), "AppleShowAllFiles-2");
+        assert_eq!(
+            quote_key("com.apple.trackpad.scaling"),
+            "\"com.apple.trackpad.scaling\""
+        );
+        assert_eq!(
+            quote_key("NSToolbar Configuration"),
+            "\"NSToolbar Configuration\""
+        );
     }
 }
